@@ -26,7 +26,7 @@ func NewMCPServer() *MCPHttpServer {
 	)
 
 	addTool := mcp.NewTool("sum",
-		mcp.WithDescription("Adds to numbers together and returns the sum"),
+		mcp.WithDescription("Adds two numbers together and returns the sum"),
 		mcp.WithNumber("x", mcp.Required(), mcp.Description("First number to add")),
 		mcp.WithNumber("y", mcp.Required(), mcp.Description("Second number to add")),
 	)
