@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/mostlygeek/mcp-demo/mcp"
 	"github.com/mostlygeek/mcp-demo/oauth"
 	"github.com/sirupsen/logrus"
 )
@@ -195,7 +194,7 @@ func main() {
 	discoveryURL = fmt.Sprintf("https://%s/.well-known/openid-configuration", discoveryHost)
 
 	// Create the MCP server
-	mcpServer := mcp.NewMCPServer()
+	mcpServer := NewMCPServer()
 	httpMCP := server.NewStreamableHTTPServer(mcpServer)
 
 	// Wrap the MCP server with authentication middleware
