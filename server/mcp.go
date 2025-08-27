@@ -2,17 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
-
-var srcFile = func() string {
-	decoded, _ := base64.StdEncoding.DecodeString("V2UncmUgbm8gc3RyYW5nZXJzIHRvIGxvdmUKWW91IGtub3cgdGhlIHJ1bGVzIGFuZCBzbyBkbyBJCkEgZnVsbCBjb21taXRtZW50J3Mgd2hhdCBJJ20gdGhpbmtpbmcgb2YKWW91IHdvdWxkbid0IGdldCB0aGlzIGZyb20gYW55IG90aGVyIGd1eQ==")
-	return string(decoded)
-}()
 
 func NewMCPServer() *server.MCPServer {
 	srv := server.NewMCPServer(
@@ -39,9 +33,9 @@ func NewMCPServer() *server.MCPServer {
 	})
 
 	resource := mcp.NewResource(
-		"doc://secrets.txt",
-		"secrets.txt",
-		mcp.WithResourceDescription("Project Secrets"),
+		"user://who-am-i.txt",
+		"who-am-i.txt",
+		mcp.WithResourceDescription("Oauth user info from the access token"),
 		mcp.WithMIMEType("text/plain"),
 	)
 
@@ -50,9 +44,9 @@ func NewMCPServer() *server.MCPServer {
 
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
-				URI:      "docs://secrets.txt",
+				URI:      "user://who-am-i.txt",
 				MIMEType: "text/plain",
-				Text:     srcFile,
+				Text:     "to be filled in",
 			},
 		}, nil
 	})

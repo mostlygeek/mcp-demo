@@ -47,6 +47,7 @@ func main() {
 	log.Debug("Creating OAuth configuration")
 	oauthConfig := client.OAuthConfig{
 		// Client ID can be empty if using dynamic registration
+		// TBD: hmm... even if these are undefined tsidp gives us a token?!
 		ClientID:     os.Getenv("MCP_CLIENT_ID"),
 		ClientSecret: os.Getenv("MCP_CLIENT_SECRET"),
 		RedirectURI:  redirectURI,
