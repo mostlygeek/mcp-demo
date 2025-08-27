@@ -1,6 +1,6 @@
 package main
 
-// proted from: https://raw.githubusercontent.com/mark3labs/mcp-go/refs/heads/main/examples/oauth_client/main.go
+// ported from: https://raw.githubusercontent.com/mark3labs/mcp-go/refs/heads/main/examples/oauth_client/main.go
 
 import (
 	"context"
