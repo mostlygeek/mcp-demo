@@ -120,6 +120,7 @@ func main() {
 		}
 	}
 
+	//
 	log.WithFields(log.Fields{
 		"server":  result.ServerInfo.Name,
 		"version": result.ServerInfo.Version,

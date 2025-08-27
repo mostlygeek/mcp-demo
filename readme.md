@@ -21,16 +21,19 @@ These are the components:
 
 ## Todo:
 
-- ▢ client that
-  - ✅ performs a MCP tool call
-  - ✅ performs a MCP resource fetch
-  - supports DCR (dynamic client registration)
-- ▢ vendor in tsidp
-  - ▢ add support for DCR
 - ▢ mcp server
   - ✅ supports Oauth2 access token authentication
   - ▢ supports [RFC9728 (April 2025)](https://www.rfc-editor.org/rfc/rfc9728.html) - OAuth 2.0 Protected Resource Metadata
     - 🙃 beyond SOTA LLM knowledge cutoff date
+  - ▢ merge the oauth/ and mcp/ packages into the server
+- ▢ client that
+  - ✅ performs a MCP tool call
+  - ✅ performs a MCP resource fetch
+  - ▢ supports DCR (dynamic client registration)
+  - ▢ toggle between Browser use and "zero click" flows
+- ▢ tsidp
+  - ▢ vendor in tsidp
+  - ▢ add support for DCR
 - ▢ reorganize repo into `/client`, `/server`, `/tsidp` subdirectories (all `main` package)
 - ▢ add a Makefile to make it easy to run (`make client`, `make server`, `make tsidp`)
 - ▢ ...
