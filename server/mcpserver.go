@@ -74,64 +74,7 @@ func authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func configHandler(w http.ResponseWriter, r *http.Request) {
-	logrus.WithFields(logrus.Fields{
-		"method": r.Method,
-		"path":   r.URL.Path,
-		"remote": r.RemoteAddr,
-	}).Debug("[CONFIG] Request received")
-
-	validator := NewOAuthValidator(discoveryURL)
-	logrus.WithField("url", discoveryURL).Debug("[CONFIG] Fetching OpenID configuration")
-
-	config, err := validator.FetchOpenIDConfiguration()
-	if err != nil {
-		logrus.WithError(err).Error("[CONFIG] Error fetching OpenID configuration")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(fmt.Sprintf("Failed to fetch OpenID configuration: %v", err)))
-		return
-	}
-
-	logrus.WithField("issuer", config.Issuer).Info("[CONFIG] Successfully fetched OpenID config")
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(config)
-	logrus.Debug("[CONFIG] Response sent successfully")
-}
-
-func userinfoHandler(w http.ResponseWriter, r *http.Request) {
-	logrus.WithFields(logrus.Fields{
-		"method": r.Method,
-		"path":   r.URL.Path,
-		"remote": r.RemoteAddr,
-	}).Debug("[USERINFO] Request received")
-
-	authHeader := r.Header.Get("Authorization")
-	token := ExtractBearerToken(authHeader)
-
-	if token == "" {
-		logrus.Info("[USERINFO] No token provided")
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Unauthorized: Missing bearer token"))
-		return
-	}
-
-	validator := NewOAuthValidator(discoveryURL)
-	logrus.Debug("[USERINFO] Fetching user info for token")
-
-	userInfo, err := validator.FetchUserInfoFromOauthServer(token)
-	if err != nil {
-		logrus.WithError(err).Info("[USERINFO] Error fetching user info")
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(fmt.Sprintf("Failed to fetch user info: %v", err)))
-		return
-	}
-
-	logrus.WithField("sub", userInfo.Sub).Info("[USERINFO] Successfully fetched user info")
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userInfo)
-	logrus.Debug("[USERINFO] Response sent successfully")
-}
-
+// Implement RFC9728 - OAuth 2.0 Protected Resource Metadata endpoint
 func oauthProtectedResourceHandler(w http.ResponseWriter, r *http.Request) {
 	logrus.WithFields(logrus.Fields{
 		"method": r.Method,
@@ -187,25 +130,12 @@ func main() {
 
 	discoveryURL = fmt.Sprintf("https://%s/.well-known/openid-configuration", discoveryHost)
 
-	// Register handlers
-	http.HandleFunc("/config", configHandler)
-	http.HandleFunc("/userinfo", userinfoHandler)
 	http.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler)
 
 	// Create the MCP server and protect it with auth middleware
 	mcpHTTPServer := NewMCPServer()
 	protectedMCPHandler := authMiddleware(mcpHTTPServer)
 	http.Handle("/mcp", protectedMCPHandler)
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		logrus.WithFields(logrus.Fields{
-			"method": r.Method,
-			"path":   r.URL.Path,
-			"remote": r.RemoteAddr,
-		}).Debug("[ROOT] Health check request")
-		w.Write([]byte("OAuth Resource Server is running"))
-		logrus.Debug("[ROOT] Health check response sent")
-	})
 
 	fmt.Println("========================================")
 	fmt.Println("MCP Server starting ...")
@@ -214,9 +144,6 @@ func main() {
 	fmt.Printf("  log level : %s\n", logrus.GetLevel().String())
 	fmt.Println("========================================")
 	fmt.Println("\nEndpoints:")
-	fmt.Println("  GET /           - Health check")
-	fmt.Println("  GET /config     - View OpenID configuration")
-	fmt.Println("  GET /userinfo   - Get user info with Bearer token")
 	fmt.Println("  GET /.well-known/oauth-protected-resource - OAuth protected resource metadata")
 	fmt.Println("  POST /mcp       - MCP server endpoint (requires Bearer token)")
 
