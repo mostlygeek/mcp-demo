@@ -26,9 +26,12 @@ These are the components:
   - ▢ supports [RFC9728 (April 2025)](https://www.rfc-editor.org/rfc/rfc9728.html) - OAuth 2.0 Protected Resource Metadata
     - 🙃 beyond SOTA LLM knowledge cutoff date
   - ▢ merge the oauth/ and mcp/ packages into the server
+  - ▢ accept `-listen` on cli, default to `localhost:8080`
 - ▢ client that
   - ✅ performs a MCP tool call
   - ✅ performs a MCP resource fetch
+  - ▢ accept `-mcpURL` flag, default to `http://localhost:8080/mcp`
+  - ▢ accept `-callbackURL` flag, default to `http://localhost:8085/oauth/callback`,
   - ▢ supports DCR (dynamic client registration)
   - ▢ toggle between Browser use and "zero click" flows
 - ▢ tsidp
