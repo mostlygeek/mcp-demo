@@ -12,7 +12,7 @@ Demonstrated is a zero-click authentication flow where the client goes through t
 ## Running it:
 
 1. copy the `.env.example` to `.env` and customize for your environment
-2. run `make` pull in dependencies
+2. run `make` to pull in dependencies
 3. run `make tsidp` to start the identity server. follow auth instructions.
 4. in another terminal, run `make server`
 5. finally, in another terminal, run `make client`
