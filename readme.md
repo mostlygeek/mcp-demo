@@ -1,17 +1,22 @@
 # What is this?
 
-This repo is an answer to these question:
+This repo is an exploration of what the developer experience could be like building MCP servers on a tailnet. tsidp provides OAuth2 access tokens and user information about the tailescale authenticated user.
 
-As a developer:
+Demonstrated is a zero-click authentication flow where the client goes through these steps:
 
-- how do I build an MCP with Oauth authentication?
-- what is the most secure by default, easiest way to get my MCP server launched?
+1. client makes request to server
+2. server returns 401 Unauthorized with a `WWW-Authenticate` that redirects the clien to tsidp
+3. client does a "zero-click" flow, as accessing tsidp on the tailnet does not require a client id or secret.
+4. After successful authentication, the client makes an MCP tool and resource call.
 
-These are the components:
+## Running it:
 
-- an MCP server with required OAuth access token for `/mcp`.
-- a CLI MCP client specifically to test the server
-- tsidp - tailscale IDP
+1. copy the `.env.example` to `.env` and customize for your environment
+2. run `make` pull in dependencies
+3. run `make tsidp` to start the identity server. follow auth instructions.
+4. in another terminal, run `make server`
+5. finally, in another terminal, run `make client`
+6. observe the output
 
 ## Goal
 

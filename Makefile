@@ -6,6 +6,9 @@ else
     $(error .env file not found. Copy .env.example to .env and set your values)
 endif
 
+init:
+	go mod tidy
+
 # tsidp is its own tsnet node. keep it's hostname as mcp-demo-idp as that
 # is expected by the server.
 tsidp:
@@ -24,4 +27,4 @@ client-zero-click:
 client-browser-use:
 	LOG_LEVEL=$(LOG_LEVEL) go run ./client -browserLogin=true
 
-.PHONY: tsidp server client-zero-click client-browser-use
+.PHONY: init tsidp server client-zero-click client-browser-use
