@@ -183,9 +183,7 @@ func main() {
 				}
 			}
 		}
-
 	}
-
 }
 
 func maybeAuthorize(err error) {

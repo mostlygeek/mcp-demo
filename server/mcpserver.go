@@ -70,17 +70,6 @@ func authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func protectedHandler(w http.ResponseWriter, r *http.Request) {
-	logrus.WithFields(logrus.Fields{
-		"method": r.Method,
-		"path":   r.URL.Path,
-		"remote": r.RemoteAddr,
-	}).Debug("[PROTECTED] Request received")
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("You got through to a protected endpoint!"))
-	logrus.Debug("[PROTECTED] Response sent successfully")
-}
-
 func configHandler(w http.ResponseWriter, r *http.Request) {
 	logrus.WithFields(logrus.Fields{
 		"method": r.Method,
@@ -183,7 +172,9 @@ func main() {
 		FullTimestamp:   false,
 	})
 
+	var listenAddr string
 	flag.StringVar(&discoveryHost, "idp", "", "OIDC provider hostname (e.g., auth.example.com)")
+	flag.StringVar(&listenAddr, "listen", "localhost:8080", "Listen address for the server")
 	flag.Parse()
 
 	if discoveryHost == "" {
@@ -206,7 +197,6 @@ func main() {
 
 	// protected endpoints
 	http.Handle("/mcp", protectedMCPHandler)
-	http.Handle("/protected", authMiddleware(http.HandlerFunc(protectedHandler)))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		logrus.WithFields(logrus.Fields{
@@ -219,9 +209,10 @@ func main() {
 	})
 
 	fmt.Println("========================================")
-	fmt.Println("OAuth 2.0 Resource Server starting on :8080")
-	fmt.Printf("  idp: %s\n", discoveryURL)
-	fmt.Printf("  log level: %s\n", logrus.GetLevel().String())
+	fmt.Println("MCP Server starting ...")
+	fmt.Printf("  listen.   : %s\n", listenAddr)
+	fmt.Printf("  idp       : %s\n", discoveryURL)
+	fmt.Printf("  log level : %s\n", logrus.GetLevel().String())
 	fmt.Println("========================================")
 	fmt.Println("\nEndpoints:")
 	fmt.Println("  GET /           - Health check")
@@ -229,7 +220,6 @@ func main() {
 	fmt.Println("  GET /userinfo   - Get user info with Bearer token")
 	fmt.Println("  GET /.well-known/oauth-protected-resource - OAuth protected resource metadata")
 	fmt.Println("  POST /mcp       - MCP server endpoint (requires Bearer token)")
-	fmt.Println("  GET /protected  - Protected endpoint (requires Bearer token)")
 
-	logrus.Fatal(http.ListenAndServe("localhost:8080", nil))
+	logrus.Fatal(http.ListenAndServe(listenAddr, nil))
 }
