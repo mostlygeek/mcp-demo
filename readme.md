@@ -12,10 +12,10 @@ Demonstrated is a zero-click authentication flow where the client goes through t
 ## Running it:
 
 1. copy the `.env.example` to `.env` and customize for your environment
-2. run `make` to pull in dependencies
-3. run `make tsidp` to start the identity server. follow auth instructions.
-4. in another terminal, run `make server`
-5. finally, in another terminal, run `make client`
+2. `make` - to pull in dependencies
+3. `make tsidp` - starts tsidp server. follow auth instructions.
+4. `make server` - starts the MCP server. Use a separate terminal window.
+5. `make client-zero-click` - runs client clow. Use a separate terminal window.
 6. observe the output
 
 ## Goal
