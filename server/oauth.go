@@ -1,4 +1,4 @@
-package oauth
+package main
 
 import (
 	"encoding/json"
@@ -25,12 +25,11 @@ type UserInfo struct {
 	UserName string `json:"username"`
 }
 
-
 type Validator struct {
 	discoveryURL string
 }
 
-func NewValidator(discoveryURL string) *Validator {
+func NewOAuthValidator(discoveryURL string) *Validator {
 	return &Validator{
 		discoveryURL: discoveryURL,
 	}
@@ -60,7 +59,7 @@ func (v *Validator) FetchOpenIDConfiguration() (*OpenIDConfiguration, error) {
 	return &config, nil
 }
 
-func (v *Validator) FetchUserInfo(accessToken string) (*UserInfo, error) {
+func (v *Validator) FetchUserInfoFromOauthServer(accessToken string) (*UserInfo, error) {
 	config, err := v.FetchOpenIDConfiguration()
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch OpenID configuration: %v", err)
@@ -103,7 +102,7 @@ func (v *Validator) FetchUserInfo(accessToken string) (*UserInfo, error) {
 }
 
 func (v *Validator) ValidateAccessToken(accessToken string) (*UserInfo, error) {
-	userInfo, err := v.FetchUserInfo(accessToken)
+	userInfo, err := v.FetchUserInfoFromOauthServer(accessToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate access token: %v", err)
 	}

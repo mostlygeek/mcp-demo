@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/mostlygeek/mcp-demo/oauth"
 	"github.com/sirupsen/logrus"
 )
 
@@ -30,10 +29,10 @@ func authMiddleware(next http.Handler) http.Handler {
 
 		logrus.WithField("auth_header", authHeader).Debug("[AUTH] Authorization header")
 
-		token := oauth.ExtractBearerToken(authHeader)
+		token := ExtractBearerToken(authHeader)
 		logrus.WithField("has_token", token != "").Debug("[AUTH] Extracted token")
 
-		validator := oauth.NewValidator(discoveryURL)
+		validator := NewOAuthValidator(discoveryURL)
 
 		if token == "" {
 			logrus.Debug("[AUTH] No token provided, fetching OpenID configuration")
@@ -89,7 +88,7 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 		"remote": r.RemoteAddr,
 	}).Debug("[CONFIG] Request received")
 
-	validator := oauth.NewValidator(discoveryURL)
+	validator := NewOAuthValidator(discoveryURL)
 	logrus.WithField("url", discoveryURL).Debug("[CONFIG] Fetching OpenID configuration")
 
 	config, err := validator.FetchOpenIDConfiguration()
@@ -114,7 +113,7 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 	}).Debug("[USERINFO] Request received")
 
 	authHeader := r.Header.Get("Authorization")
-	token := oauth.ExtractBearerToken(authHeader)
+	token := ExtractBearerToken(authHeader)
 
 	if token == "" {
 		logrus.Info("[USERINFO] No token provided")
@@ -123,10 +122,10 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	validator := oauth.NewValidator(discoveryURL)
+	validator := NewOAuthValidator(discoveryURL)
 	logrus.Debug("[USERINFO] Fetching user info for token")
 
-	userInfo, err := validator.FetchUserInfo(token)
+	userInfo, err := validator.FetchUserInfoFromOauthServer(token)
 	if err != nil {
 		logrus.WithError(err).Info("[USERINFO] Error fetching user info")
 		w.WriteHeader(http.StatusUnauthorized)
