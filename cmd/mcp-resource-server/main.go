@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/mostlygeek/mcp-demo/mcp"
 	"github.com/mostlygeek/mcp-demo/oauth"
+	"github.com/sirupsen/logrus"
 )
 
 var discoveryHost string
@@ -18,110 +20,133 @@ var discoveryURL string
 // authMiddleware wraps an http.Handler with OAuth authentication
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[AUTH] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-		log.Printf("[AUTH] Headers: %v", r.Header)
+		logrus.WithFields(logrus.Fields{
+			"method": r.Method,
+			"path":   r.URL.Path,
+			"remote": r.RemoteAddr,
+		}).Debug("[AUTH] Incoming request")
+		logrus.WithField("headers", r.Header).Debug("[AUTH] Request headers")
 
 		authHeader := r.Header.Get("Authorization")
 
-		log.Printf("[AUTH] Authorization header: %s", authHeader)
+		logrus.WithField("auth_header", authHeader).Debug("[AUTH] Authorization header")
 
 		token := oauth.ExtractBearerToken(authHeader)
-		log.Printf("[AUTH] Extracted token: %v", token != "")
+		logrus.WithField("has_token", token != "").Debug("[AUTH] Extracted token")
 
 		validator := oauth.NewValidator(discoveryURL)
 
 		if token == "" {
-			log.Printf("[AUTH] No token provided, fetching OpenID configuration")
+			logrus.Debug("[AUTH] No token provided, fetching OpenID configuration")
 			config, err := validator.FetchOpenIDConfiguration()
 			if err == nil {
 				authHeader := fmt.Sprintf(`Bearer realm="%s", authorization_uri="%s"`,
 					config.Issuer, config.AuthorizationEndpoint)
 				w.Header().Set("WWW-Authenticate", authHeader)
-				log.Printf("[AUTH] Set WWW-Authenticate header: %s", authHeader)
+				logrus.WithField("header", authHeader).Debug("[AUTH] Set WWW-Authenticate header")
 			} else {
-				log.Printf("[AUTH] Failed to fetch OpenID config: %v", err)
+				logrus.WithError(err).Error("[AUTH] Failed to fetch OpenID config")
 			}
 
-			log.Printf("[AUTH] Returning 401 - No token")
+			logrus.Info("[AUTH] Authentication failed - No token provided")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("Unauthorized"))
 			return
 		}
 
-		log.Printf("[AUTH] Validating access token via userinfo endpoint")
+		logrus.Debug("[AUTH] Validating access token via userinfo endpoint")
 		userInfo, err := validator.ValidateAccessToken(token)
 		if err != nil {
-			log.Printf("[AUTH] Token validation failed: %v", err)
+			logrus.WithError(err).Info("[AUTH] Token validation failed")
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("Unauthorized"))
 			return
 		}
 
-		log.Printf("[AUTH] Token validation successful for user: %s (sub: %s)", userInfo.Name, userInfo.Sub)
+		logrus.WithFields(logrus.Fields{
+			"user": userInfo.Name,
+			"sub":  userInfo.Sub,
+		}).Info("[AUTH] Token validation successful")
 		// Token is valid, pass the request to the next handler
 		next.ServeHTTP(w, r)
 	})
 }
 
 func protectedHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[PROTECTED] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	logrus.WithFields(logrus.Fields{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"remote": r.RemoteAddr,
+	}).Debug("[PROTECTED] Request received")
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte("You got through to a protected endpoint!"))
-	log.Printf("[PROTECTED] Response sent successfully")
+	logrus.Debug("[PROTECTED] Response sent successfully")
 }
 
 func configHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[CONFIG] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	logrus.WithFields(logrus.Fields{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"remote": r.RemoteAddr,
+	}).Debug("[CONFIG] Request received")
 
 	validator := oauth.NewValidator(discoveryURL)
-	log.Printf("[CONFIG] Fetching OpenID configuration from: %s", discoveryURL)
+	logrus.WithField("url", discoveryURL).Debug("[CONFIG] Fetching OpenID configuration")
 
 	config, err := validator.FetchOpenIDConfiguration()
 	if err != nil {
-		log.Printf("[CONFIG] Error fetching OpenID configuration: %v", err)
+		logrus.WithError(err).Error("[CONFIG] Error fetching OpenID configuration")
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(fmt.Sprintf("Failed to fetch OpenID configuration: %v", err)))
 		return
 	}
 
-	log.Printf("[CONFIG] Successfully fetched config - Issuer: %s", config.Issuer)
+	logrus.WithField("issuer", config.Issuer).Info("[CONFIG] Successfully fetched OpenID config")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(config)
-	log.Printf("[CONFIG] Response sent successfully")
+	logrus.Debug("[CONFIG] Response sent successfully")
 }
 
 func userinfoHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[USERINFO] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	logrus.WithFields(logrus.Fields{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"remote": r.RemoteAddr,
+	}).Debug("[USERINFO] Request received")
 
 	authHeader := r.Header.Get("Authorization")
 	token := oauth.ExtractBearerToken(authHeader)
 
 	if token == "" {
-		log.Printf("[USERINFO] No token provided")
+		logrus.Info("[USERINFO] No token provided")
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte("Unauthorized: Missing bearer token"))
 		return
 	}
 
 	validator := oauth.NewValidator(discoveryURL)
-	log.Printf("[USERINFO] Fetching user info for token")
+	logrus.Debug("[USERINFO] Fetching user info for token")
 
 	userInfo, err := validator.FetchUserInfo(token)
 	if err != nil {
-		log.Printf("[USERINFO] Error fetching user info: %v", err)
+		logrus.WithError(err).Info("[USERINFO] Error fetching user info")
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(fmt.Sprintf("Failed to fetch user info: %v", err)))
 		return
 	}
 
-	log.Printf("[USERINFO] Successfully fetched user info for: %s", userInfo.Sub)
+	logrus.WithField("sub", userInfo.Sub).Info("[USERINFO] Successfully fetched user info")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(userInfo)
-	log.Printf("[USERINFO] Response sent successfully")
+	logrus.Debug("[USERINFO] Response sent successfully")
 }
 
 func oauthProtectedResourceHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[OAUTH-PROTECTED-RESOURCE] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	logrus.WithFields(logrus.Fields{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"remote": r.RemoteAddr,
+	}).Debug("[OAUTH-PROTECTED-RESOURCE] Request received")
 
 	// OAuth Protected Resource Discovery metadata
 	// This follows the OAuth 2.0 Protected Resource Metadata specification
@@ -136,15 +161,35 @@ func oauthProtectedResourceHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(metadata)
-	log.Printf("[OAUTH-PROTECTED-RESOURCE] Response sent successfully")
+	logrus.Debug("[OAUTH-PROTECTED-RESOURCE] Response sent successfully")
 }
 
 func main() {
+	// Configure logging based on LOG_LEVEL environment variable
+	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
+	switch logLevel {
+	case "debug":
+		logrus.SetLevel(logrus.DebugLevel)
+	case "error":
+		logrus.SetLevel(logrus.ErrorLevel)
+	case "info", "":
+		logrus.SetLevel(logrus.InfoLevel)
+	default:
+		logrus.SetLevel(logrus.InfoLevel)
+		logrus.WithField("LOG_LEVEL", logLevel).Warn("Unknown LOG_LEVEL, defaulting to info")
+	}
+
+	// Set formatter for cleaner output
+	logrus.SetFormatter(&logrus.TextFormatter{
+		TimestampFormat: "2006-01-02 15:04:05",
+		FullTimestamp:   false,
+	})
+
 	flag.StringVar(&discoveryHost, "idp", "", "OIDC provider hostname (e.g., auth.example.com)")
 	flag.Parse()
 
 	if discoveryHost == "" {
-		log.Fatal("Error: -idp flag is required\nUsage: mcp-resource-server -idp <hostname>")
+		logrus.Fatal("Error: -idp flag is required\nUsage: mcp-resource-server -idp <hostname>")
 	}
 
 	discoveryURL = fmt.Sprintf("https://%s/.well-known/openid-configuration", discoveryHost)
@@ -166,17 +211,20 @@ func main() {
 	http.Handle("/protected", authMiddleware(http.HandlerFunc(protectedHandler)))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[ROOT] Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		logrus.WithFields(logrus.Fields{
+			"method": r.Method,
+			"path":   r.URL.Path,
+			"remote": r.RemoteAddr,
+		}).Debug("[ROOT] Health check request")
 		w.Write([]byte("OAuth Resource Server is running"))
-		log.Printf("[ROOT] Health check response sent")
+		logrus.Debug("[ROOT] Health check response sent")
 	})
 
-	log.Println("========================================")
-	log.Println("OAuth 2.0 Resource Server starting on :8080")
-	log.Printf("Discovery URL: %s\n", discoveryURL)
-	log.Println("\nDebug logging enabled for all HTTP handlers")
-	log.Println("Watch for [AUTH], [CONFIG], [USERINFO], [PROTECTED], [ROOT] prefixes")
-	log.Println("========================================")
+	fmt.Println("========================================")
+	fmt.Println("OAuth 2.0 Resource Server starting on :8080")
+	fmt.Printf("  idp: %s\n", discoveryURL)
+	fmt.Printf("  log level: %s\n", logrus.GetLevel().String())
+	fmt.Println("========================================")
 	fmt.Println("\nEndpoints:")
 	fmt.Println("  GET /           - Health check")
 	fmt.Println("  GET /config     - View OpenID configuration")
@@ -184,16 +232,6 @@ func main() {
 	fmt.Println("  GET /.well-known/oauth-protected-resource - OAuth protected resource metadata")
 	fmt.Println("  POST /mcp       - MCP server endpoint (requires Bearer token)")
 	fmt.Println("  GET /protected  - Protected endpoint (requires Bearer token)")
-	fmt.Println("\nExample usage:")
-	fmt.Println("  # Get user info:")
-	fmt.Println("  curl -H \"Authorization: Bearer <your-oauth-token>\" \\")
-	fmt.Println("       http://localhost:8080/userinfo")
-	fmt.Println("")
-	fmt.Println("  # Access MCP endpoint:")
-	fmt.Println("  curl -X POST -H \"Authorization: Bearer <your-oauth-token>\" \\")
-	fmt.Println("       -H \"Content-Type: application/json\" \\")
-	fmt.Println("       -d '{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{},\"id\":1}' \\")
-	fmt.Println("       http://localhost:8080/mcp")
 
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+	logrus.Fatal(http.ListenAndServe("localhost:8080", nil))
 }

@@ -5,14 +5,16 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -23,10 +25,26 @@ const (
 )
 
 func main() {
+	// Configure logging based on LOG_LEVEL environment variable
+	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
+	switch logLevel {
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "info":
+		log.SetLevel(log.InfoLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	default:
+		log.SetLevel(log.InfoLevel) // Default to info level
+	}
+
+	log.Debug("Starting MCP OAuth client")
+
 	// Create a token store to persist tokens
 	tokenStore := client.NewMemoryTokenStore()
 
 	// Create OAuth configuration
+	log.Debug("Creating OAuth configuration")
 	oauthConfig := client.OAuthConfig{
 		// Client ID can be empty if using dynamic registration
 		ClientID:     os.Getenv("MCP_CLIENT_ID"),
@@ -38,22 +56,32 @@ func main() {
 	}
 
 	// Create the client with OAuth support
+	log.Debug("Creating OAuth streamable HTTP client")
 	c, err := client.NewOAuthStreamableHttpClient(serverURL, oauthConfig)
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		log.WithError(err).Error("Failed to create client")
+		os.Exit(1)
 	}
 
 	// Start the client
+	log.Info("Starting client connection")
 	if err := c.Start(context.Background()); err != nil {
+		log.Debug("Initial client start failed, checking if authorization is needed")
 		maybeAuthorize(err)
+		log.Info("Retrying client start after authorization attempt")
 		if err = c.Start(context.Background()); err != nil {
-			log.Fatalf("Failed to start client: %v", err)
+			log.WithError(err).Error("Failed to start client after authorization")
+			os.Exit(1)
 		}
 	}
 
-	defer c.Close()
+	defer func() {
+		log.Debug("Closing client connection")
+		c.Close()
+	}()
 
 	// Try to initialize the client
+	log.Info("Initializing client")
 	result, err := c.Initialize(context.Background(), mcp.InitializeRequest{
 		Params: struct {
 			ProtocolVersion string                 `json:"protocolVersion"`
@@ -69,9 +97,10 @@ func main() {
 	})
 
 	if err != nil {
-		fmt.Printf("ERR1 - %v\n", err)
+		log.WithError(err).Debug("Initial client initialization failed, checking if authorization is needed")
 
 		maybeAuthorize(err)
+		log.Info("Retrying client initialization after authorization attempt")
 		result, err = c.Initialize(context.Background(), mcp.InitializeRequest{
 			Params: struct {
 				ProtocolVersion string                 `json:"protocolVersion"`
@@ -86,74 +115,83 @@ func main() {
 			},
 		})
 		if err != nil {
-			log.Fatalf("ERR2: Failed to initialize client: %v", err)
+			log.WithError(err).Error("Failed to initialize client after authorization")
+			os.Exit(1)
 		}
 	}
 
-	fmt.Printf("Client initialized successfully! Server: %s %s\n",
-		result.ServerInfo.Name,
-		result.ServerInfo.Version)
+	log.WithFields(log.Fields{
+		"server":  result.ServerInfo.Name,
+		"version": result.ServerInfo.Version,
+	}).Info("Client initialized successfully")
 
-	// Now you can use the client as usual
-	// For example, list resources
-	// resources, err := c.ListResources(context.Background(), mcp.ListResourcesRequest{})
-	// if err != nil {
-	// 	log.Fatalf("Failed to list resources: %v", err)
-	// }
-
-	// fmt.Println("Available resources:")
-	// for _, resource := range resources.Resources {
-	// 	fmt.Printf("- %s: %s\n", resource.URI, resource.Name)
-	// 	contents, _ := c.ReadResource(context.Background(), mcp.ReadResourceRequest{
-	// 		Params: mcp.ReadResourceParams{
-	// 			URI: resource.URI,
-	// 		},
-	// 	})
-	// 	if len(contents.Contents) > 0 {
-	// 		if textContent, ok := contents.Contents[0].(mcp.TextResourceContents); ok {
-	// 			fmt.Println(textContent.Text)
-	// 		}
-	// 	}
-	// }
-
-	fmt.Println("Listing Tools")
+	log.Info("Listing tools")
 	tools, err := c.ListTools(context.Background(), mcp.ListToolsRequest{})
 	if err != nil {
-		log.Fatalf("Failed to list tools: %v", err)
+		log.WithError(err).Error("Failed to list tools")
+		os.Exit(1)
 	}
 
-	fmt.Println("Available tools:")
+	log.Info("Available tools:")
 	for _, tool := range tools.Tools {
-		fmt.Printf("- %s: %s\n", tool.Name, tool.Description)
+		log.Infof("  - %s: %s\n", tool.Name, tool.Description)
 	}
 
 	// call the sum tool with parameters
 
+	// make x, y random numbers
+	x := rand.Intn(100)
+	y := rand.Intn(100)
+	log.Infof("Calling sum tool with x=%d, y=%d", x, y)
 	toolResult, err := c.CallTool(context.Background(), mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name: "sum",
 			Arguments: map[string]any{
-				"x": 5,
-				"y": 3,
+				"x": x,
+				"y": y,
 			},
 		},
 	})
 	if err != nil || toolResult.IsError {
-		log.Fatalf("Failed to call tool: %v", err)
+		log.WithError(err).Error("Failed to call tool")
+		os.Exit(1)
 	} else {
 		if len(toolResult.Content) > 0 {
 			if textContent, ok := toolResult.Content[0].(mcp.TextContent); ok {
-				fmt.Printf("Tool result: %s\n", textContent.Text)
+				log.Infof("  - result: '%s'\n", textContent.Text)
 			}
 		}
+	}
+
+	resources, err := c.ListResources(context.Background(), mcp.ListResourcesRequest{})
+	if err != nil {
+		log.Errorf("Failed to list resources: %v", err)
+	} else {
+		log.Info("Available resources:")
+		for _, resource := range resources.Resources {
+			log.Infof("  - %s: %s\n", resource.URI, resource.Name)
+			contents, _ := c.ReadResource(context.Background(), mcp.ReadResourceRequest{
+				Params: mcp.ReadResourceParams{
+					URI: resource.URI,
+				},
+			})
+			if len(contents.Contents) > 0 {
+				log.Info("Contents of resource:")
+				if textContent, ok := contents.Contents[0].(mcp.TextResourceContents); ok {
+					fmt.Println(textContent.Text)
+				}
+			}
+		}
+
 	}
 
 }
 
 func maybeAuthorize(err error) {
+	log.Info("Attempting maybeAuthorize")
 	// Check if we need OAuth authorization
 	if client.IsOAuthAuthorizationRequiredError(err) {
-		fmt.Println("OAuth authorization required. Starting authorization flow...")
+		log.Info("OAuth authorization required, starting authorization flow")
 
 		// Get the OAuth handler from the error
 		oauthHandler := client.GetOAuthHandler(err)
@@ -164,16 +202,20 @@ func maybeAuthorize(err error) {
 		defer server.Close()
 
 		// Generate PKCE code verifier and challenge
+		log.Debug("Generating PKCE code verifier and challenge")
 		codeVerifier, err := client.GenerateCodeVerifier()
 		if err != nil {
-			log.Fatalf("Failed to generate code verifier: %v", err)
+			log.WithError(err).Error("Failed to generate code verifier")
+			os.Exit(1)
 		}
 		codeChallenge := client.GenerateCodeChallenge(codeVerifier)
 
 		// Generate state parameter
+		log.Debug("Generating state parameter")
 		state, err := client.GenerateState()
 		if err != nil {
-			log.Fatalf("Failed to generate state: %v", err)
+			log.WithError(err).Error("Failed to generate state")
+			os.Exit(1)
 		}
 
 		// BEN: commented out client registration since we're using a pre-registered client
@@ -183,37 +225,48 @@ func maybeAuthorize(err error) {
 		// }
 
 		// Get the authorization URL
+		log.Debug("Getting authorization URL")
 		authURL, err := oauthHandler.GetAuthorizationURL(context.Background(), state, codeChallenge)
 		if err != nil {
-			log.Fatalf("Failed to get authorization URL: %v", err)
+			log.WithError(err).Error("Failed to get authorization URL")
+			os.Exit(1)
 		}
 
 		// Open the browser to the authorization URL .. then tsidp will redirect to our callback url: localhost:8085/oauth/callback
-		fmt.Printf("Opening browser to: %s\n", authURL)
+		log.WithField("url", authURL).Info("Opening browser to authorization URL")
 		openBrowser(authURL)
 
 		// Wait for the callback
-		fmt.Println("Waiting for authorization callback...")
+		log.Info("Waiting for authorization callback")
 		params := <-callbackChan
+		log.Debug("Received callback parameters")
 
 		// Verify state parameter
 		if params["state"] != state {
-			log.Fatalf("State mismatch: expected %s, got %s", state, params["state"])
+			log.WithFields(log.Fields{
+				"expected": state,
+				"got":      params["state"],
+			}).Error("State mismatch in OAuth callback")
+			os.Exit(1)
 		}
 
 		// Exchange the authorization code for a token
 		code := params["code"]
 		if code == "" {
-			log.Fatalf("No authorization code received")
+			log.Error("No authorization code received")
+			os.Exit(1)
 		}
 
-		fmt.Println("Exchanging authorization code for token...", code, state, codeVerifier)
+		log.Debug("Exchanging authorization code for token")
 		err = oauthHandler.ProcessAuthorizationResponse(context.Background(), code, state, codeVerifier)
 		if err != nil {
-			log.Fatalf("Failed to process authorization response: %v", err)
+			log.WithError(err).Error("Failed to process authorization response")
+			os.Exit(1)
 		}
 
-		fmt.Println("Authorization successful!")
+		log.Info("Authorization successful")
+	} else {
+		log.Debug("Authorization not required for this error")
 	}
 }
 
@@ -266,13 +319,14 @@ func startCallbackServer(callbackChan chan<- map[string]string) *http.Server {
 			</html>
 		`))
 		if err != nil {
-			log.Printf("Error writing response: %v", err)
+			log.WithError(err).Error("Error writing OAuth callback response")
 		}
 	})
 
 	go func() {
+		log.Debug("Starting OAuth callback server on localhost:8085")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("HTTP server error: %v", err)
+			log.WithError(err).Error("HTTP server error")
 		}
 	}()
 
@@ -295,7 +349,7 @@ func openBrowser(url string) {
 	}
 
 	if err != nil {
-		log.Printf("Failed to open browser: %v", err)
-		fmt.Printf("Please open the following URL in your browser: %s\n", url)
+		log.WithError(err).Debug("Failed to open browser automatically")
+		log.WithField("url", url).Info("Please open the following URL in your browser")
 	}
 }

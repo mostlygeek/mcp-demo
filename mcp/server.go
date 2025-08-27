@@ -35,9 +35,6 @@ func NewMCPServer() *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-
-		fmt.Println("Received tool call with x:", x, "y:", y) // Debug
-
 		return mcp.NewToolResultText(fmt.Sprintf("The sum is: %d", x+y)), nil
 	})
 
