@@ -15,7 +15,13 @@ tsidp:
 server:
 	LOG_LEVEL=$(LOG_LEVEL) go run ./server -idp mcp-demo-idp.$(TAILNET_NAME).ts.net
 
-client:
+# zero click login since with tsidp we call the auth endpoint and the redirect
+# endpoints directly.
+client-zero-click:
 	LOG_LEVEL=$(LOG_LEVEL) go run ./client
 
-.PHONY: tsidp server client
+# use the standard browser login flow
+client-browser-use:
+	LOG_LEVEL=$(LOG_LEVEL) go run ./client -browserLogin=true
+
+.PHONY: tsidp server client-zero-click client-browser-use

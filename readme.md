@@ -35,8 +35,8 @@ These are the components:
   - ▢ accept `-mcpURL` flag, default to `http://localhost:8080/mcp`
   - ▢ accept `-callbackURL` flag, default to `http://localhost:8085/oauth/callback`,
   - ▢ supports DCR (dynamic client registration)
-  - ▢ change default flow to "zero click"
-  - ▢ add a `-browserLogin` flag to use the browser login flow
+  - ✅ change default flow to "zero click"
+  - ✅ add a `-browserLogin` flag to use the browser login flow
 - ▢ tsidp
   - ▢ vendor in tsidp
   - ▢ add support for DCR

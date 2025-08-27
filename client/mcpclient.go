@@ -4,9 +4,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -24,7 +26,13 @@ const (
 	redirectURI = "http://localhost:8085/oauth/callback"
 )
 
+var browserLogin bool
+
 func main() {
+	// Parse command line flags
+	flag.BoolVar(&browserLogin, "browserLogin", false, "Use browser-based login instead of zero-click authentication")
+	flag.Parse()
+
 	// Configure logging based on LOG_LEVEL environment variable
 	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
 	switch logLevel {
@@ -239,9 +247,20 @@ func maybeAuthorize(err error) {
 			os.Exit(1)
 		}
 
-		// Open the browser to the authorization URL .. then tsidp will redirect to our callback url: localhost:8085/oauth/callback
-		log.WithField("url", authURL).Info("Opening browser to authorization URL")
-		openBrowser(authURL)
+		// Choose authentication method based on flag
+		if browserLogin {
+			// Open the browser to the authorization URL .. then tsidp will redirect to our callback url: localhost:8085/oauth/callback
+			log.WithField("url", authURL).Info("Opening browser to authorization URL")
+			openBrowser(authURL)
+		} else {
+			// Use zero-click authentication
+			log.Info("Performing zero-click authorization")
+			err := zeroClick(authURL, callbackChan)
+			if err != nil {
+				log.WithError(err).Warn("Zero-click authorization failed, falling back to browser")
+				openBrowser(authURL)
+			}
+		}
 
 		// Wait for the callback
 		log.Info("Waiting for authorization callback")
@@ -338,6 +357,77 @@ func startCallbackServer(callbackChan chan<- map[string]string) *http.Server {
 	}()
 
 	return server
+}
+
+// zeroClick performs the authorization request directly without opening a browser
+// It makes the HTTP request and extracts the callback parameters
+func zeroClick(authURL string, callbackChan chan<- map[string]string) error {
+	log.WithField("url", authURL).Debug("Performing zero-click authorization")
+
+	// Create a custom HTTP client that doesn't follow redirects
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Stop following redirects
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Make the HTTP request
+	resp, err := client.Get(authURL)
+	if err != nil {
+		return fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.WithField("status", resp.StatusCode).Debug("Received response")
+
+	// Check if the response is a redirect to the callback URL
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := resp.Header.Get("Location")
+		log.WithField("location", location).Debug("Got redirect")
+
+		if location != "" && strings.HasPrefix(location, redirectURI) {
+			// Parse the callback URL to extract parameters
+			callbackURL, err := parseURL(location)
+			if err != nil {
+				return fmt.Errorf("failed to parse callback URL: %w", err)
+			}
+
+			// Extract query parameters
+			params := make(map[string]string)
+			for key, values := range callbackURL.Query() {
+				if len(values) > 0 {
+					params[key] = values[0]
+				}
+			}
+
+			log.WithField("params", params).Debug("Extracted parameters")
+
+			// Make an async request to the callback server which will send to callbackChan
+			// This must be async to avoid blocking while the main code waits on the channel
+			go func() {
+				callbackResp, err := http.Get(location)
+				if err != nil {
+					log.WithError(err).Error("Failed to hit callback server")
+					// If the callback fails, send an error state to unblock
+					callbackChan <- map[string]string{"error": err.Error()}
+				} else {
+					callbackResp.Body.Close()
+				}
+			}()
+
+			log.Debug("Zero-click authorization initiated")
+			return nil
+		}
+	}
+
+	// If not a redirect or unexpected response, return error
+	return fmt.Errorf("unexpected response: status %d", resp.StatusCode)
+}
+
+// parseURL is a helper function to parse URL strings
+func parseURL(urlStr string) (*url.URL, error) {
+	return url.Parse(urlStr)
 }
 
 // openBrowser opens the default browser to the specified URL
