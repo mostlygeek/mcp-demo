@@ -47,13 +47,20 @@ func main() {
 	log.Debug("Creating OAuth configuration")
 	oauthConfig := client.OAuthConfig{
 		// Client ID can be empty if using dynamic registration
-		// TBD: hmm... even if these are undefined tsidp gives us a token?!
+
+		// NOTE: tsidp only uses these when it is operating in funnel mode.
+		// Within the tailnet these are effectively ignored. So they can
+		// be blank when sent to tsidp.
+		//
+		// when running in funnel mode, use dynamic client registration or
+		// provide these values. See tsidp.go :: allowRelyingParty(...)
 		ClientID:     os.Getenv("MCP_CLIENT_ID"),
 		ClientSecret: os.Getenv("MCP_CLIENT_SECRET"),
-		RedirectURI:  redirectURI,
-		Scopes:       []string{"mcp.read", "mcp.write"},
-		TokenStore:   tokenStore,
-		PKCEEnabled:  true, // Enable PKCE for public clients
+
+		RedirectURI: redirectURI,
+		Scopes:      []string{"mcp.read", "mcp.write"},
+		TokenStore:  tokenStore,
+		PKCEEnabled: true, // Enable PKCE for public clients
 	}
 
 	// Create the client with OAuth support

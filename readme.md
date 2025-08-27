@@ -31,7 +31,7 @@ These are the components:
 - ▢ client that
   - ✅ performs a MCP tool call
   - ✅ performs a MCP resource fetch
-  - ▢ use mcp resource call to get user info
+  - ✅ use mcp resource call to get user info
   - ▢ accept `-mcpURL` flag, default to `http://localhost:8080/mcp`
   - ▢ accept `-callbackURL` flag, default to `http://localhost:8085/oauth/callback`,
   - ▢ supports DCR (dynamic client registration)
