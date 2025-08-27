@@ -80,14 +80,14 @@ func main() {
 	}
 
 	// Start the client
-	log.Info("Starting client connection")
 	if err := c.Start(context.Background()); err != nil {
 		log.Debug("Initial client start failed, checking if authorization is needed")
 		maybeAuthorize(err)
-		log.Info("Retrying client start after authorization attempt")
 		if err = c.Start(context.Background()); err != nil {
 			log.WithError(err).Error("Failed to start client after authorization")
 			os.Exit(1)
+		} else {
+			log.Info("✅ Client started successfully after authorization")
 		}
 	}
 
@@ -97,7 +97,6 @@ func main() {
 	}()
 
 	// Try to initialize the client
-	log.Info("Initializing client")
 	result, err := c.Initialize(context.Background(), mcp.InitializeRequest{
 		Params: struct {
 			ProtocolVersion string                 `json:"protocolVersion"`
@@ -116,7 +115,6 @@ func main() {
 		log.WithError(err).Debug("Initial client initialization failed, checking if authorization is needed")
 
 		maybeAuthorize(err)
-		log.Info("Retrying client initialization after authorization attempt")
 		result, err = c.Initialize(context.Background(), mcp.InitializeRequest{
 			Params: struct {
 				ProtocolVersion string                 `json:"protocolVersion"`
@@ -133,25 +131,28 @@ func main() {
 		if err != nil {
 			log.WithError(err).Error("Failed to initialize client after authorization")
 			os.Exit(1)
+		} else {
+			log.Info("✅ Client initialized after authorization")
 		}
+	} else {
+		log.WithFields(log.Fields{
+			"server":  result.ServerInfo.Name,
+			"version": result.ServerInfo.Version,
+		}).Info("✅ Successfully connected to MCP server")
 	}
 
-	//
-	log.WithFields(log.Fields{
-		"server":  result.ServerInfo.Name,
-		"version": result.ServerInfo.Version,
-	}).Info("Client initialized successfully")
-
-	log.Info("Listing tools")
 	tools, err := c.ListTools(context.Background(), mcp.ListToolsRequest{})
 	if err != nil {
 		log.WithError(err).Error("Failed to list tools")
 		os.Exit(1)
+	} else {
+		log.Info("✅ Tools listed successfully")
 	}
-
-	log.Info("Available tools:")
-	for _, tool := range tools.Tools {
-		log.Infof("  - %s: %s\n", tool.Name, tool.Description)
+	if len(tools.Tools) > 0 {
+		log.Info("Available tools:")
+		for _, tool := range tools.Tools {
+			log.Infof("  - %s: %s\n", tool.Name, tool.Description)
+		}
 	}
 
 	// call the sum tool with parameters
@@ -173,6 +174,7 @@ func main() {
 		log.WithError(err).Error("Failed to call tool")
 		os.Exit(1)
 	} else {
+		log.Info("✅ Tool called successfully")
 		if len(toolResult.Content) > 0 {
 			if textContent, ok := toolResult.Content[0].(mcp.TextContent); ok {
 				log.Infof("  - result: '%s'\n", textContent.Text)
@@ -184,18 +186,25 @@ func main() {
 	if err != nil {
 		log.Errorf("Failed to list resources: %v", err)
 	} else {
-		log.Info("Available resources:")
-		for _, resource := range resources.Resources {
-			log.Infof("  - %s: %s\n", resource.URI, resource.Name)
-			contents, _ := c.ReadResource(context.Background(), mcp.ReadResourceRequest{
-				Params: mcp.ReadResourceParams{
-					URI: resource.URI,
-				},
-			})
-			if len(contents.Contents) > 0 {
-				log.Info("Contents of resource:")
-				if textContent, ok := contents.Contents[0].(mcp.TextResourceContents); ok {
-					fmt.Println(textContent.Text)
+		log.Info("✅ Resources listed successfully")
+		if len(resources.Resources) > 0 {
+			log.Info("Available resources:")
+			for _, resource := range resources.Resources {
+				log.Infof("  - %s: %s\n", resource.URI, resource.Name)
+				contents, err := c.ReadResource(context.Background(), mcp.ReadResourceRequest{
+					Params: mcp.ReadResourceParams{
+						URI: resource.URI,
+					},
+				})
+				if err != nil {
+					log.WithError(err).Error("Failed to read resource")
+				} else {
+					log.Info("✅ Resource contents retrieved:")
+					if len(contents.Contents) > 0 {
+						if textContent, ok := contents.Contents[0].(mcp.TextResourceContents); ok {
+							fmt.Println(textContent.Text)
+						}
+					}
 				}
 			}
 		}
@@ -203,10 +212,10 @@ func main() {
 }
 
 func maybeAuthorize(err error) {
-	log.Info("Attempting maybeAuthorize")
+	log.Debug("Checking if authorization is needed")
 	// Check if we need OAuth authorization
 	if client.IsOAuthAuthorizationRequiredError(err) {
-		log.Info("OAuth authorization required, starting authorization flow")
+		log.Info("✅ OAuth authorization required, starting flow")
 
 		// Get the OAuth handler from the error
 		oauthHandler := client.GetOAuthHandler(err)
@@ -245,6 +254,8 @@ func maybeAuthorize(err error) {
 		if err != nil {
 			log.WithError(err).Error("Failed to get authorization URL")
 			os.Exit(1)
+		} else {
+			log.Info("✅ Authorization URL obtained")
 		}
 
 		// Choose authentication method based on flag
@@ -254,16 +265,18 @@ func maybeAuthorize(err error) {
 			openBrowser(authURL)
 		} else {
 			// Use zero-click authentication
-			log.Info("Performing zero-click authorization")
+			log.Debug("Attempting zero-click authorization")
 			err := zeroClick(authURL, callbackChan)
 			if err != nil {
 				log.WithError(err).Warn("Zero-click authorization failed, falling back to browser")
 				openBrowser(authURL)
+			} else {
+				log.Info("✅ Zero-click authorization initiated")
 			}
 		}
 
 		// Wait for the callback
-		log.Info("Waiting for authorization callback")
+		log.Debug("Waiting for authorization callback")
 		params := <-callbackChan
 		log.Debug("Received callback parameters")
 
@@ -288,9 +301,9 @@ func maybeAuthorize(err error) {
 		if err != nil {
 			log.WithError(err).Error("Failed to process authorization response")
 			os.Exit(1)
+		} else {
+			log.Info("✅ Authorization successful")
 		}
-
-		log.Info("Authorization successful")
 	} else {
 		log.Debug("Authorization not required for this error")
 	}
