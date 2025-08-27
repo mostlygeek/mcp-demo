@@ -25,6 +25,16 @@ type UserInfo struct {
 	UserName string `json:"username"`
 }
 
+func (u *UserInfo) String() string {
+	return fmt.Sprintf(`User Information:
+    username: %s
+    name: %s
+    email: %s
+    picture: %s
+    sub: %s`,
+		u.UserName, u.Name, u.Email, u.Picture, u.Sub)
+}
+
 type Validator struct {
 	discoveryURL string
 }

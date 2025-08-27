@@ -3,12 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-func NewMCPServer() *server.MCPServer {
+type authKey struct{}
+type MCPHttpServer struct {
+	httpServer *server.StreamableHTTPServer
+}
+
+func (m *MCPHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.httpServer.ServeHTTP(w, r)
+}
+
+func NewMCPServer() *MCPHttpServer {
 	srv := server.NewMCPServer(
 		"demo-server",
 		"0.0.1",
@@ -41,14 +51,24 @@ func NewMCPServer() *server.MCPServer {
 
 	// Add resource with its handler
 	srv.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		textContent := "ERROR: no user info in context"
+
+		// HINT:
+		// userInfo is set in the context in authMiddleware(http.Handler) in mcpserver.go
+		// it is simply pulled out of the context and reused
+		userInfo, ok := ctx.Value(authKey{}).(*UserInfo)
+		if ok {
+			textContent = userInfo.String()
+		}
 
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
 				URI:      "user://who-am-i.txt",
 				MIMEType: "text/plain",
-				Text:     "to be filled in",
+				Text:     textContent,
 			},
 		}, nil
 	})
-	return srv
+
+	return &MCPHttpServer{httpServer: server.NewStreamableHTTPServer(srv)}
 }

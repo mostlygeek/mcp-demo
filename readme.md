@@ -27,7 +27,7 @@ These are the components:
     - 🙃 beyond SOTA LLM knowledge cutoff date
   - ✅ merge the oauth/ and mcp/ packages into the server
   - ✅ accept `-listen` on cli, default to `localhost:8080`
-  - ▢ change mcp resource to return user info
+  - ✅ change mcp resource to return user info
 - ▢ client that
   - ✅ performs a MCP tool call
   - ✅ performs a MCP resource fetch

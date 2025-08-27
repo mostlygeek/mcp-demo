@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mark3labs/mcp-go/server"
 	"github.com/sirupsen/logrus"
 )
 
@@ -66,6 +66,10 @@ func authMiddleware(next http.Handler) http.Handler {
 			"sub":  userInfo.Sub,
 		}).Info("[AUTH] Token validation successful")
 		// Token is valid, pass the request to the next handler
+
+		// update r.Context with user info
+		ctx := context.WithValue(r.Context(), authKey{}, userInfo)
+		r = r.WithContext(ctx)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -183,19 +187,14 @@ func main() {
 
 	discoveryURL = fmt.Sprintf("https://%s/.well-known/openid-configuration", discoveryHost)
 
-	// Create the MCP server
-	mcpServer := NewMCPServer()
-	httpMCP := server.NewStreamableHTTPServer(mcpServer)
-
-	// Wrap the MCP server with authentication middleware
-	protectedMCPHandler := authMiddleware(httpMCP)
-
 	// Register handlers
 	http.HandleFunc("/config", configHandler)
 	http.HandleFunc("/userinfo", userinfoHandler)
 	http.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler)
 
-	// protected endpoints
+	// Create the MCP server and protect it with auth middleware
+	mcpHTTPServer := NewMCPServer()
+	protectedMCPHandler := authMiddleware(mcpHTTPServer)
 	http.Handle("/mcp", protectedMCPHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
