@@ -81,14 +81,10 @@ func main() {
 
 	// Start the client
 	if err := c.Start(context.Background()); err != nil {
-		log.Debug("Initial client start failed, checking if authorization is needed")
-		maybeAuthorize(err)
-		if err = c.Start(context.Background()); err != nil {
-			log.WithError(err).Error("Failed to start client after authorization")
-			os.Exit(1)
-		} else {
-			log.Info("✅ Client started successfully after authorization")
-		}
+		log.WithError(err).Info("Client.Start() failed! Unexpected")
+		os.Exit(1)
+	} else {
+		log.Info("✅ Client.Start() Successful")
 	}
 
 	defer func() {
@@ -96,8 +92,7 @@ func main() {
 		c.Close()
 	}()
 
-	// Try to initialize the client
-	result, err := c.Initialize(context.Background(), mcp.InitializeRequest{
+	mcpInitRequest := mcp.InitializeRequest{
 		Params: struct {
 			ProtocolVersion string                 `json:"protocolVersion"`
 			Capabilities    mcp.ClientCapabilities `json:"capabilities"`
@@ -109,36 +104,29 @@ func main() {
 				Version: "0.1.0",
 			},
 		},
-	})
+	}
 
+	// Try to initialize the client ... it will fail and trigger the log in flow
+	// TBD: what is in c.Initialize() that causes this to fail and expect token?
+	_, err = c.Initialize(context.Background(), mcpInitRequest)
 	if err != nil {
-		log.WithError(err).Debug("Initial client initialization failed, checking if authorization is needed")
+		log.Info("🛑 Client.Initialize() failed (expected), token missing at this point. Running maybeAuthorize() again.")
 
+		// this maybeAuthorize and c.Initialize does the oauth flow
 		maybeAuthorize(err)
-		result, err = c.Initialize(context.Background(), mcp.InitializeRequest{
-			Params: struct {
-				ProtocolVersion string                 `json:"protocolVersion"`
-				Capabilities    mcp.ClientCapabilities `json:"capabilities"`
-				ClientInfo      mcp.Implementation     `json:"clientInfo"`
-			}{
-				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-				ClientInfo: mcp.Implementation{
-					Name:    "mcp-go-oauth-example",
-					Version: "0.1.0",
-				},
-			},
-		})
+
+		_, err := c.Initialize(context.Background(), mcpInitRequest)
+
 		if err != nil {
 			log.WithError(err).Error("Failed to initialize client after authorization")
 			os.Exit(1)
 		} else {
+			// this is hit after the token is is obtained
 			log.Info("✅ Client initialized after authorization")
 		}
 	} else {
-		log.WithFields(log.Fields{
-			"server":  result.ServerInfo.Name,
-			"version": result.ServerInfo.Version,
-		}).Info("✅ Successfully connected to MCP server")
+		log.Info("Client.Initialize passed (UNEXPECTED), requires auth")
+		os.Exit(1)
 	}
 
 	tools, err := c.ListTools(context.Background(), mcp.ListToolsRequest{})
@@ -209,10 +197,14 @@ func main() {
 			}
 		}
 	}
+
 }
 
 func maybeAuthorize(err error) {
-	log.Debug("Checking if authorization is needed")
+	log.Debug("🔐 maybeAuthorize() - Enter")
+	defer func() {
+		log.Debug("🔓 maybeAuthorize() - Exit")
+	}()
 	// Check if we need OAuth authorization
 	if client.IsOAuthAuthorizationRequiredError(err) {
 		log.Info("✅ OAuth authorization required, starting flow")
@@ -226,7 +218,6 @@ func maybeAuthorize(err error) {
 		defer server.Close()
 
 		// Generate PKCE code verifier and challenge
-		log.Debug("Generating PKCE code verifier and challenge")
 		codeVerifier, err := client.GenerateCodeVerifier()
 		if err != nil {
 			log.WithError(err).Error("Failed to generate code verifier")
@@ -235,7 +226,6 @@ func maybeAuthorize(err error) {
 		codeChallenge := client.GenerateCodeChallenge(codeVerifier)
 
 		// Generate state parameter
-		log.Debug("Generating state parameter")
 		state, err := client.GenerateState()
 		if err != nil {
 			log.WithError(err).Error("Failed to generate state")
@@ -248,14 +238,16 @@ func maybeAuthorize(err error) {
 		// 	log.Fatalf("Failed to register client: %v", err)
 		// }
 
-		// Get the authorization URL
-		log.Debug("Getting authorization URL")
+		// Get the authorization URL ...
+
+		log.Debug("👀 Discoverying authorization endpoint and generating a URL for it ...")
 		authURL, err := oauthHandler.GetAuthorizationURL(context.Background(), state, codeChallenge)
 		if err != nil {
-			log.WithError(err).Error("Failed to get authorization URL")
+			log.WithError(err).Error("Failed to discover authorization URL")
 			os.Exit(1)
 		} else {
 			log.Info("✅ Authorization URL obtained")
+			log.Debugf("auth url: %s", authURL)
 		}
 
 		// Choose authentication method based on flag
@@ -265,7 +257,6 @@ func maybeAuthorize(err error) {
 			openBrowser(authURL)
 		} else {
 			// Use zero-click authentication
-			log.Debug("Attempting zero-click authorization")
 			err := zeroClick(authURL, callbackChan)
 			if err != nil {
 				log.WithError(err).Warn("Zero-click authorization failed, falling back to browser")
@@ -276,9 +267,9 @@ func maybeAuthorize(err error) {
 		}
 
 		// Wait for the callback
-		log.Debug("Waiting for authorization callback")
+		log.Debug("🕦 Waiting for authorization callback on callbackChan")
 		params := <-callbackChan
-		log.Debug("Received callback parameters")
+		log.Debug("⬅️ Received callback parameters")
 
 		// Verify state parameter
 		if params["state"] != state {
@@ -296,13 +287,13 @@ func maybeAuthorize(err error) {
 			os.Exit(1)
 		}
 
-		log.Debug("Exchanging authorization code for token")
+		log.Debug("➡️ Exchanging authorization code for token")
 		err = oauthHandler.ProcessAuthorizationResponse(context.Background(), code, state, codeVerifier)
 		if err != nil {
 			log.WithError(err).Error("Failed to process authorization response")
 			os.Exit(1)
 		} else {
-			log.Info("✅ Authorization successful")
+			log.Info("✅ Authorization Token Obtained")
 		}
 	} else {
 		log.Debug("Authorization not required for this error")
@@ -363,7 +354,7 @@ func startCallbackServer(callbackChan chan<- map[string]string) *http.Server {
 	})
 
 	go func() {
-		log.Debug("Starting OAuth callback server on localhost:8085")
+		log.Debug("🔄 Starting http handler for /oauth/callback ")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.WithError(err).Error("HTTP server error")
 		}
@@ -375,7 +366,7 @@ func startCallbackServer(callbackChan chan<- map[string]string) *http.Server {
 // zeroClick performs the authorization request directly without opening a browser
 // It makes the HTTP request and extracts the callback parameters
 func zeroClick(authURL string, callbackChan chan<- map[string]string) error {
-	log.WithField("url", authURL).Debug("Performing zero-click authorization")
+	log.Debug("Performing zero-click authorization")
 
 	// Create a custom HTTP client that doesn't follow redirects
 	client := &http.Client{
@@ -392,12 +383,12 @@ func zeroClick(authURL string, callbackChan chan<- map[string]string) error {
 	}
 	defer resp.Body.Close()
 
-	log.WithField("status", resp.StatusCode).Debug("Received response")
+	log.WithField("status", resp.StatusCode).Debug("Recieved /authorize/... response")
 
 	// Check if the response is a redirect to the callback URL
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		location := resp.Header.Get("Location")
-		log.WithField("location", location).Debug("Got redirect")
+		log.WithField("location", location).Debug("Following redirect ...")
 
 		if location != "" && strings.HasPrefix(location, redirectURI) {
 			// Parse the callback URL to extract parameters
@@ -414,7 +405,7 @@ func zeroClick(authURL string, callbackChan chan<- map[string]string) error {
 				}
 			}
 
-			log.WithField("params", params).Debug("Extracted parameters")
+			//log.WithField("params", params).Debug("Extracted parameters")
 
 			// Make an async request to the callback server which will send to callbackChan
 			// This must be async to avoid blocking while the main code waits on the channel
@@ -428,8 +419,6 @@ func zeroClick(authURL string, callbackChan chan<- map[string]string) error {
 					callbackResp.Body.Close()
 				}
 			}()
-
-			log.Debug("Zero-click authorization initiated")
 			return nil
 		}
 	}

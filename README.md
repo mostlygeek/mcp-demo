@@ -9,7 +9,7 @@ Demonstrated is a zero-click authentication flow where the client goes through t
 3. client does a "zero-click" flow, as accessing tsidp on the tailnet does not require a client id or secret.
 4. After successful authentication, the client makes an MCP tool and resource call.
 
-## Running it:
+## Running zero-click client flow:
 
 1. copy the `.env.example` to `.env` and customize for your environment
 2. `make` - to pull in dependencies
@@ -17,6 +17,64 @@ Demonstrated is a zero-click authentication flow where the client goes through t
 4. `make server` - starts the MCP server. Use a separate terminal window.
 5. `make client-zero-click` - runs client clow. Use a separate terminal window.
 6. observe the output
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant C as mcpclient
+    participant I as tsidp
+    participant S as mcpserver
+
+    U->>C: `make client-zero-click`
+    C->+S: GET /.well-known/oauth-protected-resource
+    S-->>-C: {authorization_servers: [tsidp.{tsnet}.ts.net], ...}
+
+    C->+I: GET /.well-known/openid-configuration
+    I-->>-C: {authorization_endpoint: ...}
+
+    C->+I: GET /authorize?params=...
+    I-->>-C: redirect localhost:8085/oauth/callback?code=...
+    C->>C: ignore redirect, extract `code` param
+    C->>+I: /token?code=...
+    I-->>-C: respond {token}
+
+    # init 1
+    C->+S: POST /mcp (tbd figure out what this is)
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: (some response)
+
+    # init 2
+    C->+S: POST /mcp (tbd figure out what this is)
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: (some response)
+
+
+    # list tools request
+    C->+S: POST /mcp list-tools
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: {tool list json}
+
+    # call tool
+    C->+S: POST /mcp tool-call `sum x y` ...
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: {`sum` tool response}
+
+    # list list resources
+    C->+S: POST /mcp list-resources
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: {resource-list response}
+
+    # fetch resource
+    C->+S: POST /mcp fetch-resource `user://who-am-i.txt` ...
+    S->+I: (auth check) GET /userinfo, Bearer: ...
+    I-->>-S: {user info}
+    S-->>-C: resource: {tsnet identity information}
+```
 
 ## Goal
 
@@ -49,9 +107,16 @@ Demonstrated is a zero-click authentication flow where the client goes through t
 - ✅ add a Makefile to make it easy to run (`make client`, `make server`, `make tsidp`)
 - ▢ ...
 
-## Notes about funnel-tsidp flow
+---
 
-Here's how this flow works:
+## Notes about funnel-tsidp
+
+- tsidp's `/authorize` endpoint must be called on tailnet.
+  - It will response with a 401 Unauthorized otherwise.
+  - all other endpoints `/token`, `/userinfo`, `/clients` can be called over Funnel
+- the mcp resource server (`mcpserver`) can be run anywhere
+- the mcp client (`mcpclient`) has to be run in the (any?) tailnet as it will
+- the `make tsidp-funnel`, the `/token` endpoint can be called by
 
 ### The Setup
 
@@ -84,4 +149,4 @@ When an external app wants to authenticate a Tailscale user:
 
 ### The Key Insight
 
-The `/authorize/funnel` endpoint is accessed by **Tailscale users** (not via funnel) who are authorizing **external apps** (that will later access via funnel). It's the user-facing part of the OAuth flow, while the `/token` endpoint is the machine-to-machine part that actually uses funnel.
+The `/authorize/funnel` endpoint is accessed by **Tailscale users** (not via funnel) who are authorizing **external apps** (that will later access via funnel with calls to `/token`). It's the user-facing part of the OAuth flow, while the `/token` endpoint is the machine-to-machine part that actually uses funnel.
