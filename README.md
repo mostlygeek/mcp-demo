@@ -150,3 +150,49 @@ When an external app wants to authenticate a Tailscale user:
 ### The Key Insight
 
 The `/authorize/funnel` endpoint is accessed by **Tailscale users** (not via funnel) who are authorizing **external apps** (that will later access via funnel with calls to `/token`). It's the user-facing part of the OAuth flow, while the `/token` endpoint is the machine-to-machine part that actually uses funnel.
+
+---
+
+## MCP Oauth Authentication Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant User's Browser
+    box rgb(220,255,220)
+        participant Authorization Server
+        participant Authz Endpoint as `/authorize`
+        participant Token Endpoint as `/token`
+    end
+    participant MCP Server
+    Client->>+MCP Server: GET /protected/resource
+    Note right of Client: (1) Initial request without a token.
+    MCP Server-->>-Client: 401 Unauthorized <br/>WWW-Authenticate: Bearer realm="mcp", resource="https://mcp.example.com"
+    Note left of Client: (2) MCP Server directs client to metadata.
+    Client->>Authorization Server: GET /.well-known/oauth-authorization-server
+    Note right of Client: (3) Discover endpoints.
+    Authorization Server-->>Client: 200 OK (JSON)
+    Note over Client,Authorization Server: (4) Client extracts `authorization_endpoint` and `token_endpoint`.
+    Client->>User's Browser: Redirect User to Authz Endpoint
+    Note right of Client: (5) Redirect for user consent.<br/>URL includes: `response_type=code`, `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, and `resource`.
+    activate User's Browser
+    User's Browser->>Authz Endpoint: HTTP GET /authorize
+    Authz Endpoint->>User's Browser: Render Login / Consent UI
+    Note over User's Browser,Authz Endpoint: (6) User enters credentials and approves access.
+    User's Browser->>Authz Endpoint: User clicks 'Allow'
+    Authz Endpoint->>User's Browser: HTTP 302 Redirect to Client's `redirect_uri`
+    Note over User's Browser,Authz Endpoint: (7) Redirect includes: `code` and `state`.
+    deactivate User's Browser
+    User's Browser-->>Client: `redirect_uri` with `?code=xyz&state=abc`
+    Client->>+Token Endpoint: POST /token
+    Note right of Client: (8) Back-channel request.<br/>Body includes: `grant_type=authorization_code`, `code=xyz`, `redirect_uri`, `client_id`, `code_verifier`, and `resource`.
+    Token Endpoint->>Token Endpoint: Validate `code`, `client_id`, `code_verifier`.
+    Note right of Token Endpoint: (9) Verify `code_verifier` against stored `code_challenge` and issue tokens.
+    Token Endpoint-->>-Client: 200 OK<br/>Response body with `access_token` and `refresh_token`.
+    Client->>+MCP Server: GET /protected/resource
+    Note right of Client: (10) Retry request with token.<br/>Header: `Authorization: Bearer <access_token>`.
+    MCP Server->>MCP Server: Validate token's signature, expiry, and audience (`aud` claim).
+    Note right of MCP Server: (11) Token validation success.
+    MCP Server-->>-Client: 200 OK (Protected Resource)
+```
