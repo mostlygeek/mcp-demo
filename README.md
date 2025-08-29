@@ -38,38 +38,38 @@ sequenceDiagram
     C->>+I: /token?code=...
     I-->>-C: respond {token}
 
-    # init 1
+    %% init 1
     C->+S: POST /mcp (tbd figure out what this is)
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
     S-->>-C: (some response)
 
-    # init 2
+    %% init 2
     C->+S: POST /mcp (tbd figure out what this is)
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
     S-->>-C: (some response)
 
 
-    # list tools request
+    %% list tools request
     C->+S: POST /mcp list-tools
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
     S-->>-C: {tool list json}
 
-    # call tool
+    %% call tool
     C->+S: POST /mcp tool-call `sum x y` ...
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
     S-->>-C: {`sum` tool response}
 
-    # list list resources
+    %% list list resources
     C->+S: POST /mcp list-resources
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
     S-->>-C: {resource-list response}
 
-    # fetch resource
+    %% fetch resource
     C->+S: POST /mcp fetch-resource `user://who-am-i.txt` ...
     S->+I: (auth check) GET /userinfo, Bearer: ...
     I-->>-S: {user info}
