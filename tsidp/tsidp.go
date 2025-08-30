@@ -11,6 +11,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -346,6 +347,12 @@ type authRequest struct {
 	// redirectURI is the redirect_uri presented in the request.
 	redirectURI string
 
+	// codeChallenge is the PKCE code challenge from the authorization request.
+	codeChallenge string
+
+	// codeChallengeMethod is the PKCE method ("S256" or "plain").
+	codeChallengeMethod string
+
 	// remoteUser is the user who is being authenticated.
 	remoteUser *apitype.WhoIsResponse
 
@@ -427,10 +434,20 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 
 	code := rands.HexString(32)
 	ar := &authRequest{
-		nonce:       uq.Get("nonce"),
-		remoteUser:  who,
-		redirectURI: redirectURI,
-		clientID:    uq.Get("client_id"),
+		nonce:               uq.Get("nonce"),
+		remoteUser:          who,
+		redirectURI:         redirectURI,
+		clientID:            uq.Get("client_id"),
+		codeChallenge:       uq.Get("code_challenge"),
+		codeChallengeMethod: uq.Get("code_challenge_method"),
+	}
+
+	// Validate code challenge method if provided
+	if ar.codeChallenge != "" && ar.codeChallengeMethod != "" {
+		if ar.codeChallengeMethod != "S256" && ar.codeChallengeMethod != "plain" {
+			http.Error(w, "tsidp: unsupported code_challenge_method", http.StatusBadRequest)
+			return
+		}
 	}
 
 	if r.URL.Path == "/authorize/funnel" {
@@ -731,6 +748,19 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsidp: redirect_uri mismatch", http.StatusBadRequest)
 		return
 	}
+
+	// Verify PKCE code verifier if code challenge was provided
+	if ar.codeChallenge != "" {
+		codeVerifier := r.FormValue("code_verifier")
+		if codeVerifier == "" {
+			http.Error(w, "tsidp: code_verifier is required when code_challenge was used", http.StatusBadRequest)
+			return
+		}
+		if !verifyCodeChallenge(ar.codeChallenge, ar.codeChallengeMethod, codeVerifier) {
+			http.Error(w, "tsidp: invalid code_verifier", http.StatusBadRequest)
+			return
+		}
+	}
 	signer, err := s.oidcSigner()
 	if err != nil {
 		log.Printf("Error getting signer: %v", err)
@@ -903,16 +933,17 @@ func (s *idpServer) serveJWKS(w http.ResponseWriter, r *http.Request) {
 // openIDProviderMetadata is a partial representation of
 // https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata.
 type openIDProviderMetadata struct {
-	Issuer                           string              `json:"issuer"`
-	AuthorizationEndpoint            string              `json:"authorization_endpoint,omitempty"`
-	TokenEndpoint                    string              `json:"token_endpoint,omitempty"`
-	UserInfoEndpoint                 string              `json:"userinfo_endpoint,omitempty"`
-	JWKS_URI                         string              `json:"jwks_uri"`
-	ScopesSupported                  views.Slice[string] `json:"scopes_supported"`
-	ResponseTypesSupported           views.Slice[string] `json:"response_types_supported"`
-	SubjectTypesSupported            views.Slice[string] `json:"subject_types_supported"`
-	ClaimsSupported                  views.Slice[string] `json:"claims_supported"`
-	IDTokenSigningAlgValuesSupported views.Slice[string] `json:"id_token_signing_alg_values_supported"`
+	Issuer                                     string              `json:"issuer"`
+	AuthorizationEndpoint                      string              `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint                              string              `json:"token_endpoint,omitempty"`
+	UserInfoEndpoint                           string              `json:"userinfo_endpoint,omitempty"`
+	JWKS_URI                                   string              `json:"jwks_uri"`
+	ScopesSupported                            views.Slice[string] `json:"scopes_supported"`
+	ResponseTypesSupported                     views.Slice[string] `json:"response_types_supported"`
+	SubjectTypesSupported                      views.Slice[string] `json:"subject_types_supported"`
+	ClaimsSupported                            views.Slice[string] `json:"claims_supported"`
+	IDTokenSigningAlgValuesSupported           views.Slice[string] `json:"id_token_signing_alg_values_supported"`
+	CodeChallengeMethodsSupported              views.Slice[string] `json:"code_challenge_methods_supported,omitempty"`
 	// TODO(maisem): maybe add other fields?
 	// Currently we fill out the REQUIRED fields, scopes_supported and claims_supported.
 }
@@ -958,6 +989,9 @@ var (
 	// The algo used for signing. The OpenID spec says "The algorithm RS256 MUST be included."
 	// https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
 	openIDSupportedSigningAlgos = views.SliceOf([]string{string(jose.RS256)})
+
+	// PKCE code challenge methods supported
+	openIDSupportedCodeChallengeMethods = views.SliceOf([]string{"S256", "plain"})
 )
 
 func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
@@ -1011,6 +1045,7 @@ func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
 		SubjectTypesSupported:            openIDSupportedSubjectTypes,
 		ClaimsSupported:                  openIDSupportedClaims,
 		IDTokenSigningAlgValuesSupported: openIDSupportedSigningAlgos,
+		CodeChallengeMethodsSupported:    openIDSupportedCodeChallengeMethods,
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -1287,5 +1322,19 @@ func getConfigFilePath(rootPath string, fileName string) (string, error) {
 		return filepath.Join(rootPath, fileName), nil
 	} else {
 		return "", err
+	}
+}
+
+// verifyCodeChallenge verifies a PKCE code verifier against a code challenge.
+func verifyCodeChallenge(challenge, method, verifier string) bool {
+	switch method {
+	case "plain":
+		return challenge == verifier
+	case "S256":
+		h := sha256.Sum256([]byte(verifier))
+		encoded := base64.RawURLEncoding.EncodeToString(h[:])
+		return challenge == encoded
+	default:
+		return false
 	}
 }
