@@ -30,7 +30,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,9 +61,6 @@ type ctxConn struct{}
 // accessing the IDP over Funnel are persisted.
 const funnelClientsFile = "oidc-funnel-clients.json"
 
-// oidcKeyFile is where the OIDC private key is persisted.
-const oidcKeyFile = "oidc-key.json"
-
 var (
 	flagVerbose            = flag.Bool("verbose", false, "be verbose")
 	flagPort               = flag.Int("port", 443, "port to listen on")
@@ -73,6 +69,7 @@ var (
 	flagFunnel             = flag.Bool("funnel", false, "use Tailscale Funnel to make tsidp available on the public internet")
 	flagHostname           = flag.String("hostname", "idp", "tsnet hostname to use instead of idp")
 	flagDir                = flag.String("dir", "", "tsnet state directory; a default one will be created if not provided")
+	flagEnableSTS          = flag.Bool("enable-sts", false, "enable OIDC STS token exchange support")
 )
 
 func main() {
@@ -85,14 +82,12 @@ func main() {
 	var (
 		lc          *local.Client
 		st          *ipnstate.Status
-		rootPath    string
 		err         error
 		watcherChan chan error
 		cleanup     func()
 
 		lns []net.Listener
 	)
-
 	if *flagUseLocalTailscaled {
 		lc = &local.Client{}
 		st, err = lc.StatusWithoutPeers(ctx)
@@ -115,15 +110,6 @@ func main() {
 		}
 		if !anySuccess {
 			log.Fatalf("failed to listen on any of %v", st.TailscaleIPs)
-		}
-
-		if flagDir == nil || *flagDir == "" {
-			// use user config directory as storage for tsidp oidc key
-			configDir, err := os.UserConfigDir()
-			if err != nil {
-				log.Fatalf("getting user config directory: %v", err)
-			}
-			rootPath = filepath.Join(configDir, "tsidp")
 		}
 
 		// tailscaled needs to be setting an HTTP header for funneled requests
@@ -167,18 +153,14 @@ func main() {
 			log.Fatal(err)
 		}
 		lns = append(lns, ln)
-
-		rootPath = ts.GetRootPath()
-		log.Printf("tsidp root path: %s", rootPath)
 	}
 
 	srv := &idpServer{
 		lc:          lc,
 		funnel:      *flagFunnel,
 		localTSMode: *flagUseLocalTailscaled,
-		rootPath:    rootPath,
+		enableSTS:   *flagEnableSTS,
 	}
-
 	if *flagPort != 443 {
 		srv.serverURL = fmt.Sprintf("https://%s:%d", strings.TrimSuffix(st.Self.DNSName, "."), *flagPort)
 	} else {
@@ -187,18 +169,14 @@ func main() {
 
 	// Load funnel clients from disk if they exist, regardless of whether funnel is enabled
 	// This ensures OIDC clients persist across restarts
-	funnelClientsFilePath, err := getConfigFilePath(rootPath, funnelClientsFile)
-	if err != nil {
-		log.Fatalf("could not get funnel clients file path: %v", err)
-	}
-	f, err := os.Open(funnelClientsFilePath)
+	f, err := os.Open(funnelClientsFile)
 	if err == nil {
 		if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
-			log.Fatalf("could not parse %s: %v", funnelClientsFilePath, err)
+			log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
 		}
 		f.Close()
 	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Fatalf("could not open %s: %v", funnelClientsFilePath, err)
+		log.Fatalf("could not open %s: %v", funnelClientsFile, err)
 	}
 
 	log.Printf("Running tsidp at %s ...", srv.serverURL)
@@ -212,6 +190,27 @@ func main() {
 		}
 		lns = append(lns, ln)
 	}
+
+	// Start token cleanup routine
+	cleanupCtx, cleanupCancel := context.WithCancel(ctx)
+	defer cleanupCancel()
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				srv.cleanupExpiredTokens()
+				if *flagVerbose {
+					log.Printf("Cleaned up expired tokens")
+				}
+			case <-cleanupCtx.Done():
+				return
+			}
+		}
+	}()
 
 	for _, ln := range lns {
 		server := http.Server{
@@ -310,7 +309,7 @@ type idpServer struct {
 	serverURL   string // "https://foo.bar.ts.net"
 	funnel      bool
 	localTSMode bool
-	rootPath    string // root path, used for storing state files
+	enableSTS   bool
 
 	lazyMux        lazy.SyncValue[*http.ServeMux]
 	lazySigningKey lazy.SyncValue[*signingKey]
@@ -319,6 +318,7 @@ type idpServer struct {
 	mu            sync.Mutex               // guards the fields below
 	code          map[string]*authRequest  // keyed by random hex
 	accessToken   map[string]*authRequest  // keyed by random hex
+	refreshToken  map[string]*authRequest  // keyed by random hex
 	funnelClients map[string]*funnelClient // keyed by client ID
 }
 
@@ -347,19 +347,171 @@ type authRequest struct {
 	// redirectURI is the redirect_uri presented in the request.
 	redirectURI string
 
-	// codeChallenge is the PKCE code challenge from the authorization request.
+	// resources are the resource URIs from RFC 8707 that the client is
+	// requesting access to. These are validated at token issuance time.
+	resources []string
+
+	// scopes are the OAuth 2.0 scopes requested by the client.
+	// These are validated against supported scopes at authorization time.
+	scopes []string
+
+	// codeChallenge is the PKCE code challenge from RFC 7636.
+	// It is a derived value from the code_verifier that the client
+	// will send during token exchange.
 	codeChallenge string
 
-	// codeChallengeMethod is the PKCE method ("S256" or "plain").
+	// codeChallengeMethod is the method used to derive codeChallenge
+	// from the code_verifier. Valid values are "plain" and "S256".
+	// If empty, PKCE is not used for this request.
 	codeChallengeMethod string
 
 	// remoteUser is the user who is being authenticated.
 	remoteUser *apitype.WhoIsResponse
 
 	// validTill is the time until which the token is valid.
-	// As of 2023-11-14, it is 5 minutes.
-	// TODO: add routine to delete expired tokens.
+	// Authorization codes expire after 5 minutes per OAuth 2.0 best practices (RFC 6749 recommends max 10 minutes).
 	validTill time.Time
+
+	// jti is the unique identifier for the JWT token (JWT ID).
+	// This is used for token introspection to return the jti claim.
+	jti string
+
+	// Token exchange specific fields (RFC 8693)
+	isExchangedToken bool     // Indicates if this token was created via exchange
+	originalClientID string   // The client that originally authenticated the user
+	exchangedBy      string   // The client that performed the exchange
+	audiences        []string // All intended audiences for the token
+
+	// Delegation support (RFC 8693 act claim)
+	actorInfo *actorClaim // For delegation scenarios
+}
+
+// actorClaim represents the 'act' claim structure defined in RFC 8693 Section 4.1
+// for delegation scenarios in token exchange.
+type actorClaim struct {
+	Subject  string      `json:"sub"`
+	ClientID string      `json:"client_id,omitempty"`
+	Actor    *actorClaim `json:"act,omitempty"` // Nested for delegation chains
+}
+
+// validateScopes checks if the requested scopes are valid and supported.
+// It returns the validated scopes or an error if any scope is unsupported.
+func (s *idpServer) validateScopes(requestedScopes []string) ([]string, error) {
+	if len(requestedScopes) == 0 {
+		// Default to openid scope if none specified
+		return []string{"openid"}, nil
+	}
+
+	validatedScopes := make([]string, 0, len(requestedScopes))
+	supportedScopes := openIDSupportedScopes.AsSlice()
+
+	for _, scope := range requestedScopes {
+		supported := false
+		for _, supportedScope := range supportedScopes {
+			if scope == supportedScope {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return nil, fmt.Errorf("unsupported scope: %q", scope)
+		}
+		validatedScopes = append(validatedScopes, scope)
+	}
+
+	return validatedScopes, nil
+}
+
+// validateResourcesForUser checks if the user is allowed to access the requested resources
+func (s *idpServer) validateResourcesForUser(who *apitype.WhoIsResponse, requestedResources []string) ([]string, error) {
+	// Check ACL grant using the same capability as we would use for STS token exchange
+	rules, err := tailcfg.UnmarshalCapJSON[stsCapRule](who.CapMap, "test-tailscale.com/idp/sts/openly-allow")
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal capability: %w", err)
+	}
+
+	// Filter resources based on what the user is allowed to access
+	var allowedResources []string
+	for _, resource := range requestedResources {
+		allowed := false
+		for _, rule := range rules {
+			// Check if user matches (support wildcard or specific user)
+			userMatches := false
+			for _, user := range rule.Users {
+				if user == "*" || user == who.UserProfile.LoginName {
+					userMatches = true
+					break
+				}
+			}
+
+			if userMatches {
+				// Check if resource matches
+				for _, allowedResource := range rule.Resources {
+					if allowedResource == resource || allowedResource == "*" {
+						allowed = true
+						break
+					}
+				}
+			}
+
+			if allowed {
+				break
+			}
+		}
+
+		if allowed {
+			allowedResources = append(allowedResources, resource)
+		}
+	}
+
+	if len(allowedResources) == 0 && len(requestedResources) > 0 {
+		return nil, fmt.Errorf("access denied for requested resources")
+	}
+
+	return allowedResources, nil
+}
+
+// validateCodeVerifier validates that a code_verifier matches the stored code_challenge
+// using the specified method, as defined in RFC 7636.
+func validateCodeVerifier(verifier, challenge, method string) error {
+	// Validate code_verifier format (43-128 characters, unreserved characters only)
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return fmt.Errorf("code_verifier must be 43-128 characters")
+	}
+
+	// Check that verifier only contains unreserved characters: A-Z a-z 0-9 - . _ ~
+	for _, r := range verifier {
+		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '.' || r == '_' || r == '~') {
+			return fmt.Errorf("code_verifier contains invalid characters")
+		}
+	}
+
+	// Generate the challenge from the verifier and compare
+	generatedChallenge, err := generateCodeChallenge(verifier, method)
+	if err != nil {
+		return err
+	}
+
+	if generatedChallenge != challenge {
+		return fmt.Errorf("invalid code_verifier")
+	}
+
+	return nil
+}
+
+// generateCodeChallenge creates a code challenge from a code verifier using the specified method.
+// Supports "plain" and "S256" methods as defined in RFC 7636.
+func generateCodeChallenge(verifier, method string) (string, error) {
+	switch method {
+	case "plain":
+		return verifier, nil
+	case "S256":
+		h := sha256.Sum256([]byte(verifier))
+		return base64.RawURLEncoding.EncodeToString(h[:]), nil
+	default:
+		return "", fmt.Errorf("unsupported code_challenge_method: %s", method)
+	}
 }
 
 // allowRelyingParty validates that a relying party identified either by a
@@ -409,6 +561,7 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uq := r.URL.Query()
+	state := uq.Get("state")
 
 	redirectURI := uq.Get("redirect_uri")
 	if redirectURI == "" {
@@ -428,24 +581,45 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 	who, err := s.lc.WhoIs(r.Context(), remoteAddr)
 	if err != nil {
 		log.Printf("Error getting WhoIs: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		redirectAuthError(w, r, redirectURI, "server_error", "internal server error", state)
 		return
 	}
 
 	code := rands.HexString(32)
 	ar := &authRequest{
-		nonce:               uq.Get("nonce"),
-		remoteUser:          who,
-		redirectURI:         redirectURI,
-		clientID:            uq.Get("client_id"),
-		codeChallenge:       uq.Get("code_challenge"),
-		codeChallengeMethod: uq.Get("code_challenge_method"),
+		nonce:       uq.Get("nonce"),
+		remoteUser:  who,
+		redirectURI: redirectURI,
+		clientID:    uq.Get("client_id"),
+		resources:   uq["resource"], // RFC 8707: multiple resource parameters are allowed
 	}
 
-	// Validate code challenge method if provided
-	if ar.codeChallenge != "" && ar.codeChallengeMethod != "" {
-		if ar.codeChallengeMethod != "S256" && ar.codeChallengeMethod != "plain" {
-			http.Error(w, "tsidp: unsupported code_challenge_method", http.StatusBadRequest)
+	// Parse space-delimited scopes
+	if scopeParam := uq.Get("scope"); scopeParam != "" {
+		ar.scopes = strings.Fields(scopeParam)
+	}
+
+	// Validate scopes
+	validatedScopes, err := s.validateScopes(ar.scopes)
+	if err != nil {
+		redirectAuthError(w, r, redirectURI, "invalid_scope", fmt.Sprintf("invalid scope: %v", err), state)
+		return
+	}
+	ar.scopes = validatedScopes
+
+	// Handle PKCE parameters (RFC 7636)
+	if codeChallenge := uq.Get("code_challenge"); codeChallenge != "" {
+		ar.codeChallenge = codeChallenge
+
+		// code_challenge_method defaults to "plain" if not specified
+		ar.codeChallengeMethod = uq.Get("code_challenge_method")
+		if ar.codeChallengeMethod == "" {
+			ar.codeChallengeMethod = "plain"
+		}
+
+		// Validate the code_challenge_method
+		if ar.codeChallengeMethod != "plain" && ar.codeChallengeMethod != "S256" {
+			redirectAuthError(w, r, redirectURI, "invalid_request", "unsupported code_challenge_method", state)
 			return
 		}
 	}
@@ -455,11 +629,19 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 		c, ok := s.funnelClients[ar.clientID]
 		s.mu.Unlock()
 		if !ok {
-			http.Error(w, "tsidp: invalid client ID", http.StatusBadRequest)
+			redirectAuthError(w, r, redirectURI, "invalid_request", "invalid client ID", state)
 			return
 		}
-		if ar.redirectURI != c.RedirectURI {
-			http.Error(w, "tsidp: redirect_uri mismatch", http.StatusBadRequest)
+		// Validate redirect_uri against the client's registered redirect URIs
+		validRedirect := false
+		for _, uri := range c.RedirectURIs {
+			if ar.redirectURI == uri {
+				validRedirect = true
+				break
+			}
+		}
+		if !validRedirect {
+			redirectAuthError(w, r, redirectURI, "invalid_request", "redirect_uri mismatch", state)
 			return
 		}
 		ar.funnelRP = c
@@ -469,7 +651,7 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		ar.rpNodeID, ok = parseID[tailcfg.NodeID](strings.TrimPrefix(r.URL.Path, "/authorize/"))
 		if !ok {
-			http.Error(w, "tsidp: invalid node ID suffix after /authorize/", http.StatusBadRequest)
+			redirectAuthError(w, r, redirectURI, "invalid_request", "invalid node ID suffix after /authorize/", state)
 			return
 		}
 	}
@@ -493,9 +675,12 @@ func (s *idpServer) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc(oidcJWKSPath, s.serveJWKS)
 	mux.HandleFunc(oidcConfigPath, s.serveOpenIDConfig)
+	mux.HandleFunc(oauthMetadataPath, s.serveOAuthMetadata)
 	mux.HandleFunc("/authorize/", s.authorize)
 	mux.HandleFunc("/userinfo", s.serveUserInfo)
 	mux.HandleFunc("/token", s.serveToken)
+	mux.HandleFunc("/introspect", s.serveIntrospect)
+	mux.HandleFunc("/register", s.serveDynamicClientRegistration)
 	mux.HandleFunc("/clients/", s.serveClients)
 	mux.HandleFunc("/", s.handleUI)
 	return mux
@@ -513,7 +698,7 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	tk, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
-		http.Error(w, "tsidp: invalid Authorization header", http.StatusBadRequest)
+		writeBearerError(w, http.StatusBadRequest, "invalid_request", "invalid Authorization header")
 		return
 	}
 
@@ -521,15 +706,16 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	ar, ok := s.accessToken[tk]
 	s.mu.Unlock()
 	if !ok {
-		http.Error(w, "tsidp: invalid token", http.StatusBadRequest)
+		writeBearerError(w, http.StatusUnauthorized, "invalid_token", "invalid token")
 		return
 	}
 
 	if ar.validTill.Before(time.Now()) {
-		http.Error(w, "tsidp: token expired", http.StatusBadRequest)
+		writeBearerError(w, http.StatusUnauthorized, "invalid_token", "token expired")
 		s.mu.Lock()
 		delete(s.accessToken, tk)
 		s.mu.Unlock()
+		return
 	}
 
 	ui := userInfo{}
@@ -538,13 +724,22 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sub is always included (openid scope is mandatory)
 	ui.Sub = ar.remoteUser.Node.User.String()
-	ui.Name = ar.remoteUser.UserProfile.DisplayName
-	ui.Email = ar.remoteUser.UserProfile.LoginName
-	ui.Picture = ar.remoteUser.UserProfile.ProfilePicURL
 
-	// TODO(maisem): not sure if this is the right thing to do
-	ui.UserName, _, _ = strings.Cut(ar.remoteUser.UserProfile.LoginName, "@")
+	// Check scopes and only include claims that were authorized
+	for _, scope := range ar.scopes {
+		switch scope {
+		case "profile":
+			ui.Name = ar.remoteUser.UserProfile.DisplayName
+			ui.Picture = ar.remoteUser.UserProfile.ProfilePicURL
+			if username, _, ok := strings.Cut(ar.remoteUser.UserProfile.LoginName, "@"); ok {
+				ui.PreferredUsername = username
+			}
+		case "email":
+			ui.Email = ar.remoteUser.UserProfile.LoginName
+		}
+	}
 
 	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, tailcfg.PeerCapabilityTsIDP)
 	if err != nil {
@@ -574,16 +769,24 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 type userInfo struct {
-	Sub      string `json:"sub"`
-	Name     string `json:"name"`
-	Email    string `json:"email"`
-	Picture  string `json:"picture"`
-	UserName string `json:"username"`
+	Sub               string `json:"sub"`
+	Name              string `json:"name,omitempty"`
+	Email             string `json:"email,omitempty"`
+	Picture           string `json:"picture,omitempty"`
+	PreferredUsername string `json:"preferred_username,omitempty"`
 }
 
 type capRule struct {
 	IncludeInUserInfo bool           `json:"includeInUserInfo"`
 	ExtraClaims       map[string]any `json:"extraClaims,omitempty"` // list of features peer is allowed to edit
+}
+
+// stsCapRule represents a capability rule for future STS token exchange and (current) resource indicators.
+// It defines which users are allowed to exchange tokens for which audiences/resources.
+// This is used with the ACL capability key "tailscale.com/idp/sts/openly-allow".
+type stsCapRule struct {
+	Users     []string `json:"users"`     // list of users allowed to access resources (supports "*" wildcard)
+	Resources []string `json:"resources"` // list of audience/resource URIs the user can access
 }
 
 // flattenExtraClaims merges all ExtraClaims from a slice of capRule into a single map.
@@ -716,17 +919,314 @@ func withExtraClaims(v any, rules []capRule) (map[string]any, error) {
 }
 
 func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
+
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+	// allow all to prevent errors from client sending their own bespoke headers
+	// and having the server reject the request.
+	h.Set("Access-Control-Allow-Headers", "*")
+
+	// early return for pre-flight OPTIONS requests.
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if r.Method != "POST" {
 		http.Error(w, "tsidp: method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.FormValue("grant_type") != "authorization_code" {
-		http.Error(w, "tsidp: grant_type not supported", http.StatusBadRequest)
+
+	grantType := r.FormValue("grant_type")
+	switch grantType {
+	case "authorization_code":
+		s.handleAuthorizationCodeGrant(w, r)
+	case "refresh_token":
+		s.handleRefreshTokenGrant(w, r)
+	case "urn:ietf:params:oauth:grant-type:token-exchange":
+		if !s.enableSTS {
+			writeTokenEndpointError(w, http.StatusBadRequest, "unsupported_grant_type", "token exchange not enabled")
+			return
+		}
+		s.serveTokenExchange(w, r)
+	default:
+		writeTokenEndpointError(w, http.StatusBadRequest, "unsupported_grant_type", "")
+	}
+}
+
+// identifyClient identifies the client making the request.
+// It returns a unique identifier for the client or empty string if unauthorized.
+func (s *idpServer) identifyClient(r *http.Request) string {
+	// Check funnel client with Basic Auth
+	if clientID, clientSecret, ok := r.BasicAuth(); ok {
+		s.mu.Lock()
+		client, ok := s.funnelClients[clientID]
+		s.mu.Unlock()
+		if ok {
+			if subtle.ConstantTimeCompare([]byte(client.Secret), []byte(clientSecret)) == 1 {
+				return clientID
+			}
+		}
+	}
+
+	// Check funnel client with form parameters
+	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
+	if clientID != "" && clientSecret != "" {
+		s.mu.Lock()
+		client, ok := s.funnelClients[clientID]
+		s.mu.Unlock()
+		if ok {
+			if subtle.ConstantTimeCompare([]byte(client.Secret), []byte(clientSecret)) == 1 {
+				return clientID
+			}
+		}
+	}
+
+	// Check local client
+	ra, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err == nil && ra.Addr().IsLoopback() {
+		return "local:" + ra.Addr().String()
+	}
+
+	// Check node client
+	if s.lc != nil {
+		who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
+		if err == nil {
+			return fmt.Sprintf("node:%d", who.Node.ID)
+		}
+	}
+
+	return ""
+}
+
+// serveTokenExchange implements the OIDC STS token exchange flow per RFC 8693.
+// It validates the subject token and checks ACL grants to determine if the user
+// is allowed to exchange tokens for the requested audience.
+//
+// ACL grants are checked using the capability key "test-tailscale.com/idp/sts/openly-allow"
+// with the following format:
+//
+//	{
+//	  "src": ["tag:mcp"],
+//	  "dst": ["tag:idp"],
+//	  "app": {
+//	    "test-tailscale.com/idp/sts/openly-allow": [
+//	      {
+//	        "users": ["*"],
+//	        "resources": ["https://userz.corp.ts.net/"],
+//	      },
+//	    ],
+//	  }
+//	}
+//
+// The "users" field supports wildcards ("*") or specific user login names.
+// The "resources" field specifies the audience/resource URIs that tokens can be exchanged for.
+func (s *idpServer) serveTokenExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "tsidp: method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Parse form data
+	if err := r.ParseForm(); err != nil {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "failed to parse form")
+		return
+	}
+
+	// Validate required parameters
+	subjectToken := r.FormValue("subject_token")
+	if subjectToken == "" {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "subject_token is required")
+		return
+	}
+
+	subjectTokenType := r.FormValue("subject_token_type")
+	if subjectTokenType != "urn:ietf:params:oauth:token-type:access_token" {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "unsupported subject_token_type")
+		return
+	}
+
+	requestedTokenType := r.FormValue("requested_token_type")
+	if requestedTokenType != "" && requestedTokenType != "urn:ietf:params:oauth:token-type:access_token" {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "unsupported requested_token_type")
+		return
+	}
+
+	// Parse multiple audience parameters (RFC 8693 allows multiple)
+	audiences := r.Form["audience"]
+	if len(audiences) == 0 {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "audience is required")
+		return
+	}
+
+	// Identify the client performing the exchange
+	exchangingClientID := s.identifyClient(r)
+	if exchangingClientID == "" {
+		writeTokenEndpointError(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
+		return
+	}
+
+	// Get the funnel client if this is a funnel client
+	var exchangingFunnelClient *funnelClient
+	s.mu.Lock()
+	if client, ok := s.funnelClients[exchangingClientID]; ok {
+		exchangingFunnelClient = client
+	}
+	s.mu.Unlock()
+
+	// Validate subject token
+	s.mu.Lock()
+	ar, ok := s.accessToken[subjectToken]
+	s.mu.Unlock()
+	if !ok {
+		writeTokenEndpointError(w, http.StatusUnauthorized, "invalid_grant", "invalid subject token")
+		return
+	}
+
+	if ar.validTill.Before(time.Now()) {
+		writeTokenEndpointError(w, http.StatusUnauthorized, "invalid_grant", "subject token expired")
+		return
+	}
+
+	// Check ACL grant for STS token exchange
+	who := ar.remoteUser
+	rules, err := tailcfg.UnmarshalCapJSON[stsCapRule](who.CapMap, "test-tailscale.com/idp/sts/openly-allow")
+	if err != nil {
+		log.Printf("tsidp: failed to unmarshal STS capability: %v", err)
+		writeTokenEndpointError(w, http.StatusForbidden, "access_denied", "access denied")
+		return
+	}
+
+	// Check if user is allowed to exchange tokens for the requested audiences
+	allowedAudiences := []string{}
+	for _, audience := range audiences {
+		allowed := false
+		for _, rule := range rules {
+			// Check if user matches (support wildcard or specific user)
+			userMatches := false
+			for _, user := range rule.Users {
+				if user == "*" || user == who.UserProfile.LoginName {
+					userMatches = true
+					break
+				}
+			}
+
+			if userMatches {
+				// Check if audience/resource matches
+				for _, resource := range rule.Resources {
+					if resource == audience || resource == "*" {
+						allowed = true
+						break
+					}
+				}
+			}
+
+			if allowed {
+				break
+			}
+		}
+		if allowed {
+			allowedAudiences = append(allowedAudiences, audience)
+		}
+	}
+
+	if len(allowedAudiences) == 0 {
+		writeTokenEndpointError(w, http.StatusForbidden, "access_denied", "access denied for requested audience")
+		return
+	}
+
+	// Handle actor token for delegation (RFC 8693 Section 4.1)
+	var actorInfo *actorClaim
+	if actorTokenParam := r.FormValue("actor_token"); actorTokenParam != "" {
+		actorTokenType := r.FormValue("actor_token_type")
+		if actorTokenType != "" && actorTokenType != "urn:ietf:params:oauth:token-type:access_token" {
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "unsupported actor_token_type")
+			return
+		}
+
+		// Validate and add actor information
+		s.mu.Lock()
+		actorAR, ok := s.accessToken[actorTokenParam]
+		s.mu.Unlock()
+		if !ok || actorAR.validTill.Before(time.Now()) {
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "invalid or expired actor_token")
+			return
+		}
+
+		actorInfo = &actorClaim{
+			Subject:  actorAR.remoteUser.Node.User.String(),
+			ClientID: actorAR.clientID,
+			// Check if actor token itself has an actor (delegation chain)
+			Actor: actorAR.actorInfo,
+		}
+	}
+
+	// Generate new access token
+	newAccessToken := rands.HexString(32)
+
+	// Create new auth request with proper metadata for exchanged token
+	newAR := &authRequest{
+		clientID:         exchangingClientID,
+		isExchangedToken: true,
+		originalClientID: ar.clientID,
+		exchangedBy:      exchangingClientID,
+		audiences:        allowedAudiences,
+		validTill:        time.Now().Add(5 * time.Minute),
+		remoteUser:       who,
+		resources:        allowedAudiences, // RFC 8707 resource indicators
+		scopes:           ar.scopes,        // Preserve original scopes
+		actorInfo:        actorInfo,
+
+		// Preserve original RP context
+		localRP:  ar.localRP,
+		rpNodeID: ar.rpNodeID,
+		funnelRP: ar.funnelRP, // Keep original funnel client if it exists
+	}
+
+	// If the exchanger is a funnel client, also track it
+	if exchangingFunnelClient != nil && ar.funnelRP == nil {
+		newAR.funnelRP = exchangingFunnelClient
+	}
+
+	// Set redirect URI if available
+	if exchangingFunnelClient != nil && len(exchangingFunnelClient.RedirectURIs) > 0 {
+		newAR.redirectURI = exchangingFunnelClient.RedirectURIs[0]
+	} else if ar.redirectURI != "" {
+		newAR.redirectURI = ar.redirectURI
+	}
+
+	s.mu.Lock()
+	mak.Set(&s.accessToken, newAccessToken, newAR)
+	s.mu.Unlock()
+
+	// Return RFC 8693 compliant response
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"access_token":      newAccessToken,
+		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"token_type":        "Bearer",
+		"expires_in":        300, // 5 minutes
+	}
+
+	// Only include scope if different from requested (RFC 8693)
+	if requestedScope := r.FormValue("scope"); requestedScope != "" {
+		actualScope := strings.Join(newAR.scopes, " ")
+		if actualScope != requestedScope {
+			response["scope"] = actualScope
+		}
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		writeTokenEndpointError(w, http.StatusInternalServerError, "server_error", "internal server error")
+	}
+}
+
+func (s *idpServer) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request) {
 	code := r.FormValue("code")
 	if code == "" {
-		http.Error(w, "tsidp: code is required", http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "code is required")
 		return
 	}
 	s.mu.Lock()
@@ -736,53 +1236,167 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	if !ok {
-		http.Error(w, "tsidp: code not found", http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_grant", "code not found")
 		return
 	}
 	if err := ar.allowRelyingParty(r, s.lc); err != nil {
 		log.Printf("Error allowing relying party: %v", err)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		writeTokenEndpointError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
 	if ar.redirectURI != r.FormValue("redirect_uri") {
-		http.Error(w, "tsidp: redirect_uri mismatch", http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
 		return
 	}
 
-	// Verify PKCE code verifier if code challenge was provided
+	// PKCE validation (RFC 7636)
 	if ar.codeChallenge != "" {
 		codeVerifier := r.FormValue("code_verifier")
 		if codeVerifier == "" {
-			http.Error(w, "tsidp: code_verifier is required when code_challenge was used", http.StatusBadRequest)
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "code_verifier is required")
 			return
 		}
-		if !verifyCodeChallenge(ar.codeChallenge, ar.codeChallengeMethod, codeVerifier) {
-			http.Error(w, "tsidp: invalid code_verifier", http.StatusBadRequest)
+
+		if err := validateCodeVerifier(codeVerifier, ar.codeChallenge, ar.codeChallengeMethod); err != nil {
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 			return
 		}
 	}
+
+	// RFC 8707: Check for resource parameter in token request
+	resources := r.Form["resource"]
+	if len(resources) > 0 {
+		// Validate requested resources using the same capability would be used for STS
+		validatedResources, err := s.validateResourcesForUser(ar.remoteUser, resources)
+		if err != nil {
+			log.Printf("Error validating resources: %v", err)
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "invalid resource")
+			return
+		}
+		ar.resources = validatedResources
+	}
+	// If no resources in token request, use the ones from authorization
+
+	s.issueTokens(w, ar)
+}
+
+func (s *idpServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request) {
+	rt := r.FormValue("refresh_token")
+	if rt == "" {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "refresh_token is required")
+		return
+	}
+
+	s.mu.Lock()
+	ar, ok := s.refreshToken[rt]
+	if ok && ar.validTill.Before(time.Now()) {
+		// Token expired, remove it
+		delete(s.refreshToken, rt)
+		ok = false
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_grant", "invalid refresh token")
+		return
+	}
+
+	// Validate client authentication
+	if err := ar.allowRelyingParty(r, s.lc); err != nil {
+		log.Printf("Error allowing relying party: %v", err)
+		writeTokenEndpointError(w, http.StatusUnauthorized, "invalid_client", "")
+		return
+	}
+
+	// RFC 8707: Check for resource parameter in refresh token request
+	resources := r.Form["resource"]
+	if len(resources) > 0 {
+		// Validate requested resources are a subset of original grant
+		validatedResources, err := s.validateResourcesForUser(ar.remoteUser, resources)
+		if err != nil {
+			log.Printf("Error validating resources: %v", err)
+			writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "invalid resource")
+			return
+		}
+
+		// Ensure requested resources are subset of original grant
+		if len(ar.resources) > 0 {
+			for _, requested := range validatedResources {
+				found := false
+				for _, allowed := range ar.resources {
+					if requested == allowed {
+						found = true
+						break
+					}
+				}
+				if !found {
+					writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "requested resource not in original grant")
+					return
+				}
+			}
+		}
+
+		// Create a copy of authRequest with downscoped resources
+		arCopy := *ar
+		arCopy.resources = validatedResources
+		ar = &arCopy
+	}
+
+	// Delete the old refresh token (rotation for security)
+	s.mu.Lock()
+	delete(s.refreshToken, rt)
+	s.mu.Unlock()
+
+	s.issueTokens(w, ar)
+}
+
+func (s *idpServer) issueTokens(w http.ResponseWriter, ar *authRequest) {
 	signer, err := s.oidcSigner()
 	if err != nil {
 		log.Printf("Error getting signer: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeTokenEndpointError(w, http.StatusInternalServerError, "server_error", "internal server error")
 		return
 	}
 	jti := rands.HexString(32)
 	who := ar.remoteUser
 
-	// TODO(maisem): not sure if this is the right thing to do
-	userName, _, _ := strings.Cut(ar.remoteUser.UserProfile.LoginName, "@")
 	n := who.Node.View()
 	if n.IsTagged() {
-		http.Error(w, "tsidp: tagged nodes not supported", http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "tagged nodes not supported")
 		return
 	}
 
 	now := time.Now()
 	_, tcd, _ := strings.Cut(n.Name(), ".")
+
+	// Build audience claim - for exchanged tokens use audiences, otherwise use clientID + resources
+	var audience jwt.Audience
+	if ar.isExchangedToken && len(ar.audiences) > 0 {
+		// For exchanged tokens, use the audiences directly
+		audience = jwt.Audience(ar.audiences)
+		// Also include the original client if not already in audiences
+		hasOriginal := false
+		for _, aud := range ar.audiences {
+			if aud == ar.originalClientID {
+				hasOriginal = true
+				break
+			}
+		}
+		if !hasOriginal && ar.originalClientID != "" {
+			audience = append(audience, ar.originalClientID)
+		}
+	} else {
+		// Original behavior for non-exchanged tokens
+		audience = jwt.Audience{ar.clientID}
+		if len(ar.resources) > 0 {
+			// Add resources to the audience list (RFC 8707)
+			audience = append(audience, ar.resources...)
+		}
+	}
+
 	tsClaims := tailscaleClaims{
 		Claims: jwt.Claims{
-			Audience:  jwt.Audience{ar.clientID},
+			Audience:  audience,
 			Expiry:    jwt.NewNumericDate(now.Add(5 * time.Minute)),
 			ID:        jti,
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -797,48 +1411,206 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		NodeName:  n.Name(),
 		Tailnet:   tcd,
 		UserID:    n.User(),
-		Email:     who.UserProfile.LoginName,
-		UserName:  userName,
+	}
+
+	// Only include email and preferred_username if the appropriate scopes were granted
+	for _, scope := range ar.scopes {
+		switch scope {
+		case "email":
+			tsClaims.Email = who.UserProfile.LoginName
+		case "profile":
+			if username, _, ok := strings.Cut(who.UserProfile.LoginName, "@"); ok {
+				tsClaims.PreferredUsername = username
+			}
+			tsClaims.Picture = who.UserProfile.ProfilePicURL
+		}
 	}
 	if ar.localRP {
 		tsClaims.Issuer = s.loopbackURL
 	}
 
+	// Set azp (authorized party) claim when there are multiple audiences
+	// Per OIDC spec, azp is REQUIRED when the ID Token has multiple audiences
+	if len(audience) > 1 {
+		tsClaims.AuthorizedParty = ar.clientID
+	}
+
 	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, tailcfg.PeerCapabilityTsIDP)
 	if err != nil {
 		log.Printf("tsidp: failed to unmarshal capability: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "failed to unmarshal capability")
 		return
 	}
 
 	tsClaimsWithExtra, err := withExtraClaims(tsClaims, rules)
 	if err != nil {
 		log.Printf("tsidp: failed to merge extra claims: %v", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeTokenEndpointError(w, http.StatusBadRequest, "invalid_request", "failed to merge extra claims")
 		return
+	}
+
+	// Include act claim if present (RFC 8693 Section 4.1)
+	if ar.actorInfo != nil {
+		tsClaimsWithExtra["act"] = ar.actorInfo
 	}
 
 	// Create an OIDC token using this issuer's signer.
 	token, err := jwt.Signed(signer).Claims(tsClaimsWithExtra).CompactSerialize()
 	if err != nil {
 		log.Printf("Error getting token: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeTokenEndpointError(w, http.StatusInternalServerError, "server_error", "internal server error")
 		return
 	}
 
 	at := rands.HexString(32)
+	rt := rands.HexString(32)
 	s.mu.Lock()
 	ar.validTill = now.Add(5 * time.Minute)
+	ar.jti = jti // Store the JWT ID for introspection
 	mak.Set(&s.accessToken, at, ar)
+	// Create a new authRequest for refresh token with longer validity
+	rtAuth := *ar                                   // copy the authRequest
+	rtAuth.validTill = now.Add(30 * 24 * time.Hour) // 30 days
+	mak.Set(&s.refreshToken, rt, &rtAuth)
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(oidcTokenResponse{
-		AccessToken: at,
-		TokenType:   "Bearer",
-		ExpiresIn:   5 * 60,
-		IDToken:     token,
+		AccessToken:  at,
+		TokenType:    "Bearer",
+		ExpiresIn:    5 * 60,
+		IDToken:      token,
+		RefreshToken: rt,
 	}); err != nil {
+		writeTokenEndpointError(w, http.StatusInternalServerError, "server_error", "internal server error")
+	}
+}
+
+func (s *idpServer) serveIntrospect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "tsidp: method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the token parameter
+	token := r.FormValue("token")
+	if token == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "token is required")
+		return
+	}
+
+	// token_type_hint is optional, we can ignore it for now
+	// since we only have one type of token (access tokens)
+
+	// Look up the token
+	s.mu.Lock()
+	ar, tokenExists := s.accessToken[token]
+	s.mu.Unlock()
+
+	// Initialize response with active: false (default for invalid/expired tokens)
+	resp := map[string]any{
+		"active": false,
+	}
+
+	// Check if token exists and handle expiration
+	if tokenExists {
+		now := time.Now()
+		if ar.validTill.Before(now) {
+			// Token expired, clean it up
+			s.mu.Lock()
+			delete(s.accessToken, token)
+			s.mu.Unlock()
+			tokenExists = false
+		}
+	}
+
+	// If token exists and is not expired, we need to authenticate the client
+	if tokenExists {
+		// Check if the client is properly authenticated
+		// Any authenticated client can introspect any token
+		if s.identifyClient(r) == "" {
+			// Return inactive token for unauthorized clients
+			// This prevents token scanning attacks
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Token is valid and client is authorized, return active with metadata
+		resp["active"] = true
+		resp["client_id"] = ar.clientID
+		resp["exp"] = ar.validTill.Unix()
+		resp["iat"] = ar.validTill.Add(-5 * time.Minute).Unix() // issued 5 min before expiry
+		resp["nbf"] = ar.validTill.Add(-5 * time.Minute).Unix() // not before time (same as iat)
+		resp["token_type"] = "Bearer"
+
+		// Add issuer claim
+		if ar.localRP {
+			resp["iss"] = s.loopbackURL
+		} else {
+			resp["iss"] = s.serverURL
+		}
+
+		// Add jti if available
+		if ar.jti != "" {
+			resp["jti"] = ar.jti
+		}
+
+		if ar.remoteUser != nil && ar.remoteUser.Node != nil {
+			resp["sub"] = fmt.Sprintf("%d", ar.remoteUser.Node.User)
+
+			// Add username claim (RFC 7662 recommendation)
+			if ar.remoteUser.UserProfile != nil && ar.remoteUser.UserProfile.LoginName != "" {
+				resp["username"] = ar.remoteUser.UserProfile.LoginName
+			}
+
+			// Only include claims based on granted scopes
+			for _, scope := range ar.scopes {
+				switch scope {
+				case "profile":
+					if ar.remoteUser.UserProfile != nil {
+						if username, _, ok := strings.Cut(ar.remoteUser.UserProfile.LoginName, "@"); ok {
+							resp["preferred_username"] = username
+						}
+						resp["picture"] = ar.remoteUser.UserProfile.ProfilePicURL
+					}
+				case "email":
+					if ar.remoteUser.UserProfile != nil {
+						resp["email"] = ar.remoteUser.UserProfile.LoginName
+					}
+				}
+			}
+		}
+
+		// Add audience - for exchanged tokens use the audiences field, otherwise build from clientID and resources
+		var audience []string
+		if ar.isExchangedToken && len(ar.audiences) > 0 {
+			audience = ar.audiences
+		} else {
+			if ar.clientID != "" {
+				audience = append(audience, ar.clientID)
+			}
+			if len(ar.resources) > 0 {
+				audience = append(audience, ar.resources...)
+			}
+		}
+		if len(audience) > 0 {
+			resp["aud"] = audience
+		}
+
+		// Add scope if available
+		if len(ar.scopes) > 0 {
+			resp["scope"] = strings.Join(ar.scopes, " ")
+		}
+
+		// Include act claim if present (RFC 8693)
+		if ar.actorInfo != nil {
+			resp["act"] = ar.actorInfo
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -851,9 +1623,74 @@ type oidcTokenResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 }
 
+// oauthErrorResponse represents an OAuth 2.0 error response per RFC 6749 and RFC 7591
+type oauthErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}
+
+// writeJSONError writes an OAuth 2.0 compliant JSON error response
+func writeJSONError(w http.ResponseWriter, statusCode int, errorCode, errorDescription string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(oauthErrorResponse{
+		Error:            errorCode,
+		ErrorDescription: errorDescription,
+	})
+}
+
+// writeTokenEndpointError writes an RFC 6749 compliant token endpoint error response
+// with required headers per section 5.2
+func writeTokenEndpointError(w http.ResponseWriter, statusCode int, errorCode, errorDescription string) {
+	w.Header().Set("Content-Type", "application/json;charset=UTF-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(oauthErrorResponse{
+		Error:            errorCode,
+		ErrorDescription: errorDescription,
+	})
+}
+
+// writeBearerError writes an RFC 6750 compliant Bearer token error response
+// with WWW-Authenticate header per section 3.1
+func writeBearerError(w http.ResponseWriter, statusCode int, errorCode, errorDescription string) {
+	// Build WWW-Authenticate header value
+	authHeader := fmt.Sprintf(`Bearer error="%s"`, errorCode)
+	if errorDescription != "" {
+		authHeader += fmt.Sprintf(`, error_description="%s"`, errorDescription)
+	}
+	w.Header().Set("WWW-Authenticate", authHeader)
+	w.WriteHeader(statusCode)
+}
+
+// redirectAuthError redirects to the client's redirect_uri with error parameters
+// per RFC 6749 Section 4.1.2.1
+func redirectAuthError(w http.ResponseWriter, r *http.Request, redirectURI, errorCode, errorDescription, state string) {
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		// If redirect URI is invalid, return error directly
+		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	q := u.Query()
+	q.Set("error", errorCode)
+	if errorDescription != "" {
+		q.Set("error_description", errorDescription)
+	}
+	if state != "" {
+		q.Set("state", state)
+	}
+	u.RawQuery = q.Encode()
+
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
 const (
-	oidcJWKSPath   = "/.well-known/jwks.json"
-	oidcConfigPath = "/.well-known/openid-configuration"
+	oidcJWKSPath      = "/.well-known/jwks.json"
+	oidcConfigPath    = "/.well-known/openid-configuration"
+	oauthMetadataPath = "/.well-known/oauth-authorization-server"
 )
 
 func (s *idpServer) oidcSigner() (jose.Signer, error) {
@@ -874,12 +1711,8 @@ func (s *idpServer) oidcSigner() (jose.Signer, error) {
 
 func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 	return s.lazySigningKey.GetErr(func() (*signingKey, error) {
-		keyPath, err := getConfigFilePath(s.rootPath, oidcKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("could not get OIDC key file path: %w", err)
-		}
 		var sk signingKey
-		b, err := os.ReadFile(keyPath)
+		b, err := os.ReadFile("oidc-key.json")
 		if err == nil {
 			if err := sk.UnmarshalJSON(b); err == nil {
 				return &sk, nil
@@ -894,7 +1727,7 @@ func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 		if err != nil {
 			log.Fatalf("Error marshaling key: %v", err)
 		}
-		if err := os.WriteFile(keyPath, b, 0600); err != nil {
+		if err := os.WriteFile("oidc-key.json", b, 0600); err != nil {
 			log.Fatalf("Error writing key: %v", err)
 		}
 		return &sk, nil
@@ -903,13 +1736,13 @@ func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 
 func (s *idpServer) serveJWKS(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != oidcJWKSPath {
-		http.Error(w, "tsidp: not found", http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, "not_found", "endpoint not found")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	sk, err := s.oidcPrivateKey()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "internal server error")
 		return
 	}
 	// TODO(maisem): maybe only marshal this once and reuse?
@@ -926,26 +1759,48 @@ func (s *idpServer) serveJWKS(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "internal server error")
 	}
 }
 
 // openIDProviderMetadata is a partial representation of
 // https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata.
 type openIDProviderMetadata struct {
-	Issuer                                     string              `json:"issuer"`
-	AuthorizationEndpoint                      string              `json:"authorization_endpoint,omitempty"`
-	TokenEndpoint                              string              `json:"token_endpoint,omitempty"`
-	UserInfoEndpoint                           string              `json:"userinfo_endpoint,omitempty"`
-	JWKS_URI                                   string              `json:"jwks_uri"`
-	ScopesSupported                            views.Slice[string] `json:"scopes_supported"`
-	ResponseTypesSupported                     views.Slice[string] `json:"response_types_supported"`
-	SubjectTypesSupported                      views.Slice[string] `json:"subject_types_supported"`
-	ClaimsSupported                            views.Slice[string] `json:"claims_supported"`
-	IDTokenSigningAlgValuesSupported           views.Slice[string] `json:"id_token_signing_alg_values_supported"`
-	CodeChallengeMethodsSupported              views.Slice[string] `json:"code_challenge_methods_supported,omitempty"`
+	Issuer                           string              `json:"issuer"`
+	AuthorizationEndpoint            string              `json:"authorization_endpoint,omitempty"`
+	TokenEndpoint                    string              `json:"token_endpoint,omitempty"`
+	UserInfoEndpoint                 string              `json:"userinfo_endpoint,omitempty"`
+	IntrospectionEndpoint            string              `json:"introspection_endpoint,omitempty"`
+	RegistrationEndpoint             string              `json:"registration_endpoint,omitempty"`
+	JWKS_URI                         string              `json:"jwks_uri"`
+	ScopesSupported                  views.Slice[string] `json:"scopes_supported"`
+	ResponseTypesSupported           views.Slice[string] `json:"response_types_supported"`
+	SubjectTypesSupported            views.Slice[string] `json:"subject_types_supported"`
+	ClaimsSupported                  views.Slice[string] `json:"claims_supported"`
+	IDTokenSigningAlgValuesSupported views.Slice[string] `json:"id_token_signing_alg_values_supported"`
+	GrantTypesSupported              views.Slice[string] `json:"grant_types_supported,omitempty"`
+	CodeChallengeMethodsSupported    views.Slice[string] `json:"code_challenge_methods_supported,omitempty"`
 	// TODO(maisem): maybe add other fields?
 	// Currently we fill out the REQUIRED fields, scopes_supported and claims_supported.
+}
+
+// oauthAuthorizationServerMetadata is a representation of
+// OAuth 2.0 Authorization Server Metadata as defined in RFC 8414.
+// https://datatracker.ietf.org/doc/html/rfc8414
+type oauthAuthorizationServerMetadata struct {
+	Issuer                             string              `json:"issuer"`
+	AuthorizationEndpoint              string              `json:"authorization_endpoint"`
+	TokenEndpoint                      string              `json:"token_endpoint"`
+	IntrospectionEndpoint              string              `json:"introspection_endpoint,omitempty"`
+	RegistrationEndpoint               string              `json:"registration_endpoint,omitempty"`
+	JWKS_URI                           string              `json:"jwks_uri"`
+	ResponseTypesSupported             views.Slice[string] `json:"response_types_supported"`
+	GrantTypesSupported                views.Slice[string] `json:"grant_types_supported"`
+	ScopesSupported                    views.Slice[string] `json:"scopes_supported,omitempty"`
+	TokenEndpointAuthMethodsSupported  views.Slice[string] `json:"token_endpoint_auth_methods_supported"`
+	AuthorizationDetailsTypesSupported views.Slice[string] `json:"authorization_details_types_supported,omitempty"`
+	ResourceIndicatorsSupported        bool                `json:"resource_indicators_supported,omitempty"`
+	CodeChallengeMethodsSupported      views.Slice[string] `json:"code_challenge_methods_supported,omitempty"`
 }
 
 type tailscaleClaims struct {
@@ -961,16 +1816,21 @@ type tailscaleClaims struct {
 	Email  string         `json:"email,omitempty"` // user emailish (like "alice@github" or "bob@example.com")
 	UserID tailcfg.UserID `json:"uid,omitempty"`
 
-	// UserName is the local part of Email (without '@' and domain).
-	// It is a temporary (2023-11-15) hack during development.
-	// We should probably let this be configured via grants.
-	UserName string `json:"username,omitempty"`
+	// PreferredUsername is the local part of Email (without '@' and domain).
+	PreferredUsername string `json:"preferred_username,omitempty"`
+
+	// Picture is the user's profile picture URL.
+	Picture string `json:"picture,omitempty"`
+
+	// AuthorizedParty (azp) is required when the ID token has multiple audiences.
+	// It indicates the party to which the ID token was issued.
+	AuthorizedParty string `json:"azp,omitempty"`
 }
 
 var (
 	openIDSupportedClaims = views.SliceOf([]string{
 		// Standard claims, these correspond to fields in jwt.Claims.
-		"sub", "aud", "exp", "iat", "iss", "jti", "nbf", "username", "email",
+		"sub", "aud", "exp", "iat", "iss", "jti", "nbf", "preferred_username", "email", "picture", "azp",
 
 		// Tailscale claims, these correspond to fields in tailscaleClaims.
 		"key", "addresses", "nid", "node", "tailnet", "tags", "user", "uid",
@@ -990,8 +1850,12 @@ var (
 	// https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
 	openIDSupportedSigningAlgos = views.SliceOf([]string{string(jose.RS256)})
 
-	// PKCE code challenge methods supported
-	openIDSupportedCodeChallengeMethods = views.SliceOf([]string{"S256", "plain"})
+	// OAuth 2.0 specific metadata constants
+	oauthSupportedGrantTypes               = views.SliceOf([]string{"authorization_code", "refresh_token"})
+	oauthSupportedTokenEndpointAuthMethods = views.SliceOf([]string{"client_secret_post", "client_secret_basic"})
+
+	// PKCE support (RFC 7636)
+	pkceCodeChallengeMethodsSupported = views.SliceOf([]string{"plain", "S256"})
 )
 
 func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
@@ -1014,50 +1878,190 @@ func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
 	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		log.Printf("Error parsing remote addr: %v", err)
+		http.Error(w, "tsidp: invalid remote address", http.StatusBadRequest)
 		return
 	}
 	var authorizeEndpoint string
 	rpEndpoint := s.serverURL
 	if isFunnelRequest(r) {
 		authorizeEndpoint = fmt.Sprintf("%s/authorize/funnel", s.serverURL)
-	} else if who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
-		authorizeEndpoint = fmt.Sprintf("%s/authorize/%d", s.serverURL, who.Node.ID)
 	} else if ap.Addr().IsLoopback() {
 		rpEndpoint = s.loopbackURL
 		authorizeEndpoint = fmt.Sprintf("%s/authorize/localhost", s.serverURL)
+	} else if s.lc != nil {
+		if who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
+			authorizeEndpoint = fmt.Sprintf("%s/authorize/%d", s.serverURL, who.Node.ID)
+		} else {
+			log.Printf("Error getting WhoIs: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	} else {
-		log.Printf("Error getting WhoIs: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "tsidp: internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	je := json.NewEncoder(w)
 	je.SetIndent("", "  ")
-	if err := je.Encode(openIDProviderMetadata{
+	metadata := openIDProviderMetadata{
 		AuthorizationEndpoint:            authorizeEndpoint,
 		Issuer:                           rpEndpoint,
 		JWKS_URI:                         rpEndpoint + oidcJWKSPath,
 		UserInfoEndpoint:                 rpEndpoint + "/userinfo",
 		TokenEndpoint:                    rpEndpoint + "/token",
+		IntrospectionEndpoint:            rpEndpoint + "/introspect",
 		ScopesSupported:                  openIDSupportedScopes,
 		ResponseTypesSupported:           openIDSupportedReponseTypes,
 		SubjectTypesSupported:            openIDSupportedSubjectTypes,
 		ClaimsSupported:                  openIDSupportedClaims,
 		IDTokenSigningAlgValuesSupported: openIDSupportedSigningAlgos,
-		CodeChallengeMethodsSupported:    openIDSupportedCodeChallengeMethods,
-	}); err != nil {
+		CodeChallengeMethodsSupported:    pkceCodeChallengeMethodsSupported,
+	}
+
+	// Add grant types supported
+	grantTypes := []string{"authorization_code", "refresh_token"}
+	if s.enableSTS {
+		grantTypes = append(grantTypes, "urn:ietf:params:oauth:grant-type:token-exchange")
+	}
+	metadata.GrantTypesSupported = views.SliceOf(grantTypes)
+
+	// Only expose registration endpoint over tailnet, not funnel
+	if !isFunnelRequest(r) {
+		metadata.RegistrationEndpoint = rpEndpoint + "/register"
+	}
+
+	if err := je.Encode(metadata); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-// funnelClient represents an OIDC client/relying party that is accessing the
-// IDP over Funnel.
+func (s *idpServer) serveOAuthMetadata(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+	// allow all to prevent errors from client sending their own bespoke headers
+	// and having the server reject the request.
+	h.Set("Access-Control-Allow-Headers", "*")
+
+	// early return for pre-flight OPTIONS requests.
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.URL.Path != oauthMetadataPath {
+		http.Error(w, "tsidp: not found", http.StatusNotFound)
+		return
+	}
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		log.Printf("Error parsing remote addr: %v", err)
+		http.Error(w, "tsidp: invalid remote address", http.StatusBadRequest)
+		return
+	}
+	var authorizeEndpoint string
+	rpEndpoint := s.serverURL
+	if isFunnelRequest(r) {
+		authorizeEndpoint = fmt.Sprintf("%s/authorize/funnel", s.serverURL)
+	} else if ap.Addr().IsLoopback() {
+		rpEndpoint = s.loopbackURL
+		authorizeEndpoint = fmt.Sprintf("%s/authorize/localhost", s.serverURL)
+	} else if s.lc != nil {
+		if who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
+			authorizeEndpoint = fmt.Sprintf("%s/authorize/%d", s.serverURL, who.Node.ID)
+		} else {
+			log.Printf("Error getting WhoIs: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		http.Error(w, "tsidp: internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	je := json.NewEncoder(w)
+	je.SetIndent("", "  ")
+
+	// Build grant types list
+	grantTypes := []string{"authorization_code", "refresh_token"}
+	if s.enableSTS {
+		grantTypes = append(grantTypes, "urn:ietf:params:oauth:grant-type:token-exchange")
+	}
+
+	metadata := oauthAuthorizationServerMetadata{
+		Issuer:                             rpEndpoint,
+		AuthorizationEndpoint:              authorizeEndpoint,
+		TokenEndpoint:                      rpEndpoint + "/token",
+		IntrospectionEndpoint:              rpEndpoint + "/introspect",
+		JWKS_URI:                           rpEndpoint + oidcJWKSPath,
+		ResponseTypesSupported:             openIDSupportedReponseTypes,
+		GrantTypesSupported:                views.SliceOf(grantTypes),
+		ScopesSupported:                    openIDSupportedScopes,
+		TokenEndpointAuthMethodsSupported:  oauthSupportedTokenEndpointAuthMethods,
+		ResourceIndicatorsSupported:        true, // RFC 8707 support
+		AuthorizationDetailsTypesSupported: views.SliceOf([]string{"resource_indicators"}),
+		CodeChallengeMethodsSupported:      pkceCodeChallengeMethodsSupported,
+	}
+
+	// Only expose registration endpoint over tailnet, not funnel
+	if !isFunnelRequest(r) {
+		metadata.RegistrationEndpoint = rpEndpoint + "/register"
+	}
+
+	if err := je.Encode(metadata); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// funnelClient represents an OAuth 2.0/OIDC client/relying party.
+// It can be created manually via the /clients endpoint or dynamically
+// via the /register endpoint (RFC 7591).
 type funnelClient struct {
-	ID          string `json:"client_id"`
-	Secret      string `json:"client_secret,omitempty"`
-	Name        string `json:"name,omitempty"`
-	RedirectURI string `json:"redirect_uri"`
+	ID                      string    `json:"client_id"`
+	Secret                  string    `json:"client_secret,omitempty"`
+	Name                    string    `json:"client_name,omitempty"`
+	RedirectURIs            []string  `json:"redirect_uris"`
+	TokenEndpointAuthMethod string    `json:"token_endpoint_auth_method,omitempty"`
+	GrantTypes              []string  `json:"grant_types,omitempty"`
+	ResponseTypes           []string  `json:"response_types,omitempty"`
+	Scope                   string    `json:"scope,omitempty"`
+	ClientURI               string    `json:"client_uri,omitempty"`
+	LogoURI                 string    `json:"logo_uri,omitempty"`
+	Contacts                []string  `json:"contacts,omitempty"`
+	ApplicationType         string    `json:"application_type,omitempty"`
+	DynamicallyRegistered   bool      `json:"dynamically_registered,omitempty"`
+	CreatedAt               time.Time `json:"created_at,omitempty"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for backward compatibility.
+// It migrates the old singular redirect_uri field to the new redirect_uris array
+// and the old name field to client_name.
+func (c *funnelClient) UnmarshalJSON(data []byte) error {
+	type Alias funnelClient
+	aux := &struct {
+		RedirectURI string `json:"redirect_uri,omitempty"`
+		Name        string `json:"name,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(c),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// Migrate old redirect_uri to redirect_uris
+	if len(c.RedirectURIs) == 0 && aux.RedirectURI != "" {
+		c.RedirectURIs = []string{aux.RedirectURI}
+	}
+
+	// Migrate old name to client_name
+	if c.Name == "" && aux.Name != "" {
+		c.Name = aux.Name
+	}
+
+	return nil
 }
 
 // /clients is a privileged endpoint that allows the visitor to create new
@@ -1093,10 +2097,10 @@ func (s *idpServer) serveClients(w http.ResponseWriter, r *http.Request) {
 		s.serveDeleteClient(w, r, path)
 	case "GET":
 		json.NewEncoder(w).Encode(&funnelClient{
-			ID:          c.ID,
-			Name:        c.Name,
-			Secret:      "",
-			RedirectURI: c.RedirectURI,
+			ID:           c.ID,
+			Name:         c.Name,
+			Secret:       "",
+			RedirectURIs: c.RedirectURIs,
 		})
 	default:
 		http.Error(w, "tsidp: method not allowed", http.StatusMethodNotAllowed)
@@ -1116,10 +2120,10 @@ func (s *idpServer) serveNewClient(w http.ResponseWriter, r *http.Request) {
 	clientID := rands.HexString(32)
 	clientSecret := rands.HexString(64)
 	newClient := funnelClient{
-		ID:          clientID,
-		Secret:      clientSecret,
-		Name:        r.FormValue("name"),
-		RedirectURI: redirectURI,
+		ID:           clientID,
+		Secret:       clientSecret,
+		Name:         r.FormValue("name"),
+		RedirectURIs: []string{redirectURI},
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1144,14 +2148,120 @@ func (s *idpServer) serveGetClientsList(w http.ResponseWriter, r *http.Request) 
 	redactedClients := make([]funnelClient, 0, len(s.funnelClients))
 	for _, c := range s.funnelClients {
 		redactedClients = append(redactedClients, funnelClient{
-			ID:          c.ID,
-			Name:        c.Name,
-			Secret:      "",
-			RedirectURI: c.RedirectURI,
+			ID:           c.ID,
+			Name:         c.Name,
+			Secret:       "",
+			RedirectURIs: c.RedirectURIs,
 		})
 	}
 	s.mu.Unlock()
 	json.NewEncoder(w).Encode(redactedClients)
+}
+
+// serveDynamicClientRegistration implements RFC 7591 OAuth 2.0 Dynamic Client Registration
+// and OpenID Connect Dynamic Client Registration 1.0.
+func (s *idpServer) serveDynamicClientRegistration(w http.ResponseWriter, r *http.Request) {
+	// Block funnel requests - dynamic registration is only available over tailnet
+	if isFunnelRequest(r) {
+		writeJSONError(w, http.StatusForbidden, "access_denied", "dynamic client registration not available over funnel")
+		return
+	}
+	if r.Method == "OPTIONS" {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Headers", "*")
+		h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+
+		w.WriteHeader(http.StatusNoContent)
+
+		return
+	}
+
+	if r.Method != "POST" {
+		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request", "method not allowed")
+		return
+	}
+
+	// Parse registration request
+	var req struct {
+		RedirectURIs            []string `json:"redirect_uris"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
+		GrantTypes              []string `json:"grant_types,omitempty"`
+		ResponseTypes           []string `json:"response_types,omitempty"`
+		ClientName              string   `json:"client_name,omitempty"`
+		ClientURI               string   `json:"client_uri,omitempty"`
+		LogoURI                 string   `json:"logo_uri,omitempty"`
+		Scope                   string   `json:"scope,omitempty"`
+		Contacts                []string `json:"contacts,omitempty"`
+		ApplicationType         string   `json:"application_type,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
+		return
+	}
+
+	// Validate required fields per RFC 7591 and OpenID specs
+	if len(req.RedirectURIs) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "redirect_uris is required")
+		return
+	}
+
+	// Set defaults per specs
+	if req.TokenEndpointAuthMethod == "" {
+		req.TokenEndpointAuthMethod = "client_secret_basic"
+	}
+	if len(req.GrantTypes) == 0 {
+		req.GrantTypes = []string{"authorization_code"}
+	}
+	if len(req.ResponseTypes) == 0 {
+		req.ResponseTypes = []string{"code"}
+	}
+	if req.ApplicationType == "" {
+		req.ApplicationType = "web"
+	}
+
+	// Generate client credentials
+	clientID := rands.HexString(32)
+	clientSecret := rands.HexString(64)
+
+	// Create new client
+	newClient := funnelClient{
+		ID:                      clientID,
+		Secret:                  clientSecret,
+		Name:                    req.ClientName,
+		RedirectURIs:            req.RedirectURIs,
+		TokenEndpointAuthMethod: req.TokenEndpointAuthMethod,
+		GrantTypes:              req.GrantTypes,
+		ResponseTypes:           req.ResponseTypes,
+		Scope:                   req.Scope,
+		ClientURI:               req.ClientURI,
+		LogoURI:                 req.LogoURI,
+		Contacts:                req.Contacts,
+		ApplicationType:         req.ApplicationType,
+		DynamicallyRegistered:   true,
+		CreatedAt:               time.Now(),
+	}
+
+	// Store the client
+	s.mu.Lock()
+	mak.Set(&s.funnelClients, clientID, &newClient)
+	if err := s.storeFunnelClientsLocked(); err != nil {
+		s.mu.Unlock()
+		log.Printf("tsidp: error storing client: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "server_error", "internal error")
+		return
+	}
+	s.mu.Unlock()
+
+	// Return the client registration response
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Method", "GET, OPTIONS")
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(newClient)
 }
 
 func (s *idpServer) serveDeleteClient(w http.ResponseWriter, r *http.Request, clientID string) {
@@ -1190,13 +2300,30 @@ func (s *idpServer) storeFunnelClientsLocked() error {
 	if err := json.NewEncoder(&buf).Encode(s.funnelClients); err != nil {
 		return err
 	}
+	return os.WriteFile(funnelClientsFile, buf.Bytes(), 0600)
+}
 
-	funnelClientsFilePath, err := getConfigFilePath(s.rootPath, funnelClientsFile)
-	if err != nil {
-		return fmt.Errorf("storeFunnelClientsLocked: %v", err)
+// cleanupExpiredTokens removes expired access and refresh tokens from memory.
+// This prevents memory leaks from accumulating expired tokens over time.
+func (s *idpServer) cleanupExpiredTokens() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	// Clean up expired access tokens
+	for token, ar := range s.accessToken {
+		if ar.validTill.Before(now) {
+			delete(s.accessToken, token)
+		}
 	}
 
-	return os.WriteFile(funnelClientsFilePath, buf.Bytes(), 0600)
+	// Clean up expired refresh tokens
+	for token, ar := range s.refreshToken {
+		if ar.validTill.Before(now) {
+			delete(s.refreshToken, token)
+		}
+	}
 }
 
 const (
@@ -1308,33 +2435,4 @@ func isFunnelRequest(r *http.Request) bool {
 		return true
 	}
 	return false
-}
-
-// getConfigFilePath returns the path to the config file for the given file name.
-// The oidc-key.json and funnel-clients.json files were originally opened and written
-// to without paths, and ended up in /root dir or home directory of the user running
-// the process. To maintain backward compatibility, we return the naked file name if that
-// file exists already, otherwise we return the full path in the rootPath.
-func getConfigFilePath(rootPath string, fileName string) (string, error) {
-	if _, err := os.Stat(fileName); err == nil {
-		return fileName, nil
-	} else if errors.Is(err, os.ErrNotExist) {
-		return filepath.Join(rootPath, fileName), nil
-	} else {
-		return "", err
-	}
-}
-
-// verifyCodeChallenge verifies a PKCE code verifier against a code challenge.
-func verifyCodeChallenge(challenge, method, verifier string) bool {
-	switch method {
-	case "plain":
-		return challenge == verifier
-	case "S256":
-		h := sha256.Sum256([]byte(verifier))
-		encoded := base64.RawURLEncoding.EncodeToString(h[:])
-		return challenge == encoded
-	default:
-		return false
-	}
 }
