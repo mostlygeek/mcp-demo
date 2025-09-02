@@ -1516,6 +1516,7 @@ func (s *idpServer) serveIntrospect(w http.ResponseWriter, r *http.Request) {
 	if tokenExists {
 		now := time.Now()
 		if ar.validTill.Before(now) {
+
 			// Token expired, clean it up
 			s.mu.Lock()
 			delete(s.accessToken, token)
