@@ -8,7 +8,9 @@ query for information about your tailnet.
 ### Step 1. Compile the binary
 
 ```
-go build ./ts-api-mcpserver.go
+cd prototype-3
+mkdir bin
+go build -o bin/ts-api-mcpserver ./ts-api-mcpserver.go
 ```
 
 ### Step 2. Generate an Oauth client id and secret
@@ -29,7 +31,7 @@ In `Claude Desktop > Settings > Developer > Edit Config`, this MCP server:
 {
     "mcpServers": {
         "tailscale": {
-            "command": "/path/to/prototype-3/ts-api-mcpserver",
+            "command": "/path/to/prototype-3/bin/ts-api-mcpserver",
             "args": [],
             "env": {
                 "TS_OAUTH_CLIENT_ID": "<your client id>",
