@@ -6,6 +6,7 @@ require (
 	github.com/mark3labs/mcp-go v0.38.0
 	github.com/modelcontextprotocol/go-sdk v0.3.1
 	github.com/sirupsen/logrus v1.9.3
+	golang.org/x/oauth2 v0.30.0
 	gopkg.in/square/go-jose.v2 v2.6.0
 	tailscale.com v1.86.5
 )
@@ -51,6 +52,7 @@ require (
 	github.com/illarion/gonotify/v3 v3.0.2 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/jsimonetti/rtnetlink v1.4.0 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
