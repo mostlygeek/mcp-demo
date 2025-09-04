@@ -28,7 +28,7 @@ func main() {
 	flag.Parse()
 
 	if tsidpFlag == "" {
-		fmt.Println("Error: -idp flag is required")
+		fmt.Println("Error: -tsidp flag is required")
 		os.Exit(1)
 	}
 
@@ -188,7 +188,13 @@ func oauthProtectedResourceHandler(authServerUrl string) http.HandlerFunc {
 
 func fetchIntrospectionEndpoint(idpURL string) (string, error) {
 	metaURL := idpURL + "/.well-known/oauth-authorization-server"
-	resp, err := http.Get(metaURL)
+
+	// Create HTTP client with timeout so it doesn't hang forever if tsidp is not found
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(metaURL)
 	if err != nil {
 		return "", fmt.Errorf("error fetching .well-known/oauth-authorization-server: %w", err)
 	}
