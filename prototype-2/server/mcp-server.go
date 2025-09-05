@@ -79,7 +79,7 @@ func main() {
 		authWrappedHandler.ServeHTTP(w, r)
 	})
 
-	http.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler(idpURL))
+	http.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler(idpURL, "http://"+httpListenAddr))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -148,11 +148,11 @@ func createVerifier(introspectionEndpoint string) func(context.Context, string) 
 }
 
 // Implement RFC9728 - OAuth 2.0 Protected Resource Metadata endpoint
-func oauthProtectedResourceHandler(authServerUrl string) http.HandlerFunc {
+func oauthProtectedResourceHandler(authServerUrl string, resourceURL string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method == "OPTIONS" {
-			log.Println("Getting OPTIONS .well-known/oauth-protected-resource")
+			log.Println("OPTIONS .well-known/oauth-protected-resource")
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", "*")
 			h.Set("Access-Control-Allow-Headers", "*")
@@ -162,11 +162,11 @@ func oauthProtectedResourceHandler(authServerUrl string) http.HandlerFunc {
 			return
 		}
 
-		log.Println("Getting .well-known/oauth-protected-resource")
+		log.Println("GET .well-known/oauth-protected-resource")
 		// OAuth Protected Resource Discovery metadata
 		// This follows the OAuth 2.0 Protected Resource Metadata specification
 		metadata := map[string]interface{}{
-			"resource":                              "http://localhost:9933",
+			"resource":                              resourceURL,
 			"authorization_servers":                 []string{authServerUrl},
 			"bearer_methods_supported":              []string{"header"},
 			"resource_documentation":                "https://github.com/mostlygeek/mcp-demo",
@@ -188,6 +188,7 @@ func oauthProtectedResourceHandler(authServerUrl string) http.HandlerFunc {
 
 func fetchIntrospectionEndpoint(idpURL string) (string, error) {
 	metaURL := idpURL + "/.well-known/oauth-authorization-server"
+	fmt.Println("Fetching: ", metaURL)
 
 	// Create HTTP client with timeout so it doesn't hang forever if tsidp is not found
 	client := &http.Client{

@@ -1,3 +1,8 @@
+# What is this
+
+- For testing with an mcp client/server that only knows OAuth 2.1 and is entirely decoupled from tsidp.
+- Good for testing OAuth flows are working with an Oauth IDP authorization server (tsidp in this case)
+
 # How to use
 
 ## Running with Make
@@ -10,6 +15,11 @@
    - Transport type: Streamable HTTP
    - URL: http://localhost:9933
 1. Click Connect
+
+## Troubleshooting Notes
+
+- MCP Inspector
+  - will do CORS Preflight requests. IDP server is required to support OPTIONS and 204 responses.
 
 ## Running with Docker
 
