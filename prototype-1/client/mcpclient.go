@@ -66,7 +66,7 @@ func main() {
 		ClientSecret: os.Getenv("MCP_CLIENT_SECRET"),
 
 		RedirectURI: redirectURI,
-		Scopes:      []string{"mcp.read", "mcp.write"},
+		Scopes:      []string{"email", "profile"},
 		TokenStore:  tokenStore,
 		PKCEEnabled: true, // Enable PKCE for public clients
 	}
