@@ -27,10 +27,14 @@ const (
 )
 
 var browserLogin bool
+var useDynamicClientRegistration bool
+var clientID string
+var clientSecret string
 
 func main() {
 	// Parse command line flags
 	flag.BoolVar(&browserLogin, "browserLogin", false, "Use browser-based login instead of zero-click authentication")
+	flag.BoolVar(&useDynamicClientRegistration, "useDCR", false, "Use dynamic client registration")
 	flag.Parse()
 
 	// Configure logging based on LOG_LEVEL environment variable
@@ -51,6 +55,17 @@ func main() {
 	// Create a token store to persist tokens
 	tokenStore := client.NewMemoryTokenStore()
 
+	clientID = os.Getenv("MCP_CLIENT_ID")
+	clientSecret = os.Getenv("MCP_CLIENT_SECRET")
+
+	if clientID == "" {
+		log.Warn("MCP_CLIENT_ID environment variable is not set")
+	}
+
+	if clientSecret == "" {
+		log.Warn("MCP_CLIENT_SECRET environment variable is not set")
+	}
+
 	// Create OAuth configuration
 	log.Debug("Creating OAuth configuration")
 	oauthConfig := client.OAuthConfig{
@@ -62,8 +77,8 @@ func main() {
 		//
 		// when running in funnel mode, use dynamic client registration or
 		// provide these values. See tsidp.go :: allowRelyingParty(...)
-		ClientID:     os.Getenv("MCP_CLIENT_ID"),
-		ClientSecret: os.Getenv("MCP_CLIENT_SECRET"),
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 
 		RedirectURI: redirectURI,
 		Scopes:      []string{"email", "profile"},
@@ -232,11 +247,21 @@ func maybeAuthorize(err error) {
 			os.Exit(1)
 		}
 
-		// BEN: commented out client registration since we're using a pre-registered client
-		// err = oauthHandler.RegisterClient(context.Background(), "mcp-go-oauth-example")
-		// if err != nil {
-		// 	log.Fatalf("Failed to register client: %v", err)
-		// }
+		if useDynamicClientRegistration {
+			log.Info("⭐️ Dynamic client registration enabled")
+			err = oauthHandler.RegisterClient(context.Background(), "mcp-go-oauth-example")
+			if err != nil {
+				log.Fatalf("Failed to register client: %v", err)
+			}
+		} else {
+			log.Info("❌ Dynamic client registration disabled, using MCP_CLIENT_ID/MCP_CLIENT_SECRET")
+			if clientID == "" {
+				log.Warn("❌ MCP_CLIENT_ID environment variable is not set")
+			}
+			if clientSecret == "" {
+				log.Warn("❌ MCP_CLIENT_SECRET environment variable is not set")
+			}
+		}
 
 		// Get the authorization URL ...
 
@@ -323,12 +348,14 @@ func startCallbackServer(callbackChan chan<- map[string]string) *http.Server {
 		_, err := w.Write([]byte(`
 			<html>
 				<body>
-					<h1>Authorization Successful</h1>
+					<h1>MCP Client's Redirect_URI Handler</h1>
+					<p>The idp server's /authorize endpoint sent back an redirect to this page and the mcpclient opened it in your browser.</p>
+					<p>The MCP client is checking the credentials that the MCP_CLIENT_ID and MCP_CLIENT_SECRET provided work correctly.</p>
 					<p>You can now close this window and return to the application.</p>
-					<p>This window will close automatically in <span id="countdown">3</span> seconds.</p>
+					<p>This window will close automatically close.</p>
 					<button onclick="closeWindow()">Close Now</button>
 					<script>
-					let seconds = 3;
+					let seconds = 30;
 					const countdownElement = document.getElementById('countdown');
 
 					const countdown = setInterval(() => {
