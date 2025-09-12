@@ -108,8 +108,8 @@ func main() {
 
 // createVerifier creates a token verifier function that validates tokens.
 // since tsidp sends an opaque token we need to call the /introspection endpoint to validate it.
-func createVerifier(introspectionEndpoint string) func(context.Context, string) (*auth.TokenInfo, error) {
-	return func(ctx context.Context, token string) (*auth.TokenInfo, error) {
+func createVerifier(introspectionEndpoint string) func(context.Context, string, *http.Request) (*auth.TokenInfo, error) {
+	return func(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 
 		fmt.Println("IN Verifier, the token: ", token)
 
