@@ -25,6 +25,13 @@ func main() {
 
 	var httpListenAddr string
 	flag.StringVar(&httpListenAddr, "http", "localhost:9933", "http listen address")
+
+	var oauthResource string
+	flag.StringVar(&oauthResource, "resource", "", "sets resource URL, otherwise defaults to http listener value")
+
+	var enableDebug bool
+	flag.BoolVar(&enableDebug, "enable-debug", false, "enable debug mode (default: false)")
+
 	flag.Parse()
 
 	if tsidpFlag == "" {
@@ -42,12 +49,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "whoa-sdk", Version: "v0.0.1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "sum", Description: "Adds two numbers"}, Sum)
-	mcp.AddTool(server, &mcp.Tool{Name: "tokeninfo", Description: "Shows token info"}, TokenInfo)
+	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "whoa-sdk", Version: "v0.0.1"}, nil)
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "sum", Description: "Adds two numbers"}, Sum)
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "tokeninfo", Description: "Shows token info"}, TokenInfo)
 
 	streamHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return server
+		return mcpServer
 	}, nil)
 
 	// tsidp sends an opaque token so we need to call the /introspection endpoint to validate it
@@ -59,15 +66,20 @@ func main() {
 		Scopes:              []string{"email", "profile"}, /* scopes required by this server */
 	})(streamHandler)
 
+	mux := http.NewServeMux()
+	if oauthResource == "" {
+		oauthResource = "http://" + httpListenAddr
+	}
+	mux.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler(idpURL, oauthResource))
+
 	/**
 	 * Register the HTTP handlers
 	 * - /mcp
 	 * - /.well-known/oauth-protected-resource 	(RFC9728)
 	 * - / (catch all fall through for debugging)
 	 */
-	http.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("processing /mcp")
-
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("Handling MCP: " + r.Method)
 		if r.Method == "OPTIONS" {
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", "*")
@@ -79,18 +91,19 @@ func main() {
 		authWrappedHandler.ServeHTTP(w, r)
 	})
 
-	http.HandleFunc("/.well-known/oauth-protected-resource", oauthProtectedResourceHandler(idpURL, "http://"+httpListenAddr))
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "OK\n")
-
-		// log the fall through ... helpful for identifying unimplemented endpoints
-		fmt.Println(r.Method, r.URL.Path) // Log the request method and path
-	})
+	var srvHandler http.Handler = mux
+	if enableDebug {
+		srvHandler = debugPrintRequest(mux)
+	}
 
 	fmt.Printf("MCP server listening at %s\n", httpListenAddr)
-	http.ListenAndServe(httpListenAddr, nil)
+	httpServer := &http.Server{
+		Addr:    httpListenAddr,
+		Handler: srvHandler,
+	}
+	if err := httpServer.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // createVerifier creates a token verifier function that validates tokens.
@@ -137,7 +150,7 @@ func createVerifier(introspectionEndpoint string) func(context.Context, string) 
 		}
 		expirationTime := time.Unix(int64(expiration), 0)
 
-		fmt.Println("Expirtation time", expirationTime)
+		fmt.Println("Expiration time", expirationTime)
 		return &auth.TokenInfo{
 			Scopes: []string{"email", "profile"},
 			// Expiration is far, far in the future.
@@ -254,4 +267,90 @@ func Sum(ctx context.Context, req *mcp.CallToolRequest, args SumParams) (*mcp.Ca
 			&mcp.TextContent{Text: fmt.Sprintf("%d", args.X+args.Y)},
 		},
 	}, nil, nil
+}
+
+func debugPrintRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Read and store the request body
+		var requestBody []byte
+		if r.Body != nil {
+			requestBody, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewBuffer(requestBody)) // Restore body for downstream handlers
+		}
+
+		// Print request details
+		fmt.Printf("[DEBUG REQUEST] %s %s %s\n", r.Method, r.URL.Path, r.Proto)
+		fmt.Printf("[DEBUG REQUEST] Host: %s\n", r.Host)
+		fmt.Printf("[DEBUG REQUEST] RemoteAddr: %s\n", r.RemoteAddr)
+		fmt.Printf("[DEBUG REQUEST] User-Agent: %s\n", r.UserAgent())
+
+		// Print request headers
+		fmt.Printf("[DEBUG REQUEST] Headers:\n")
+		for name, values := range r.Header {
+			for _, value := range values {
+				fmt.Printf("[DEBUG REQUEST]   %s: %s\n", name, value)
+			}
+		}
+
+		// Print request body if present
+		if len(requestBody) > 0 {
+			fmt.Printf("[DEBUG REQUEST] Body:\n%s\n", string(requestBody))
+		} else {
+			fmt.Printf("[DEBUG REQUEST] Body: (empty)\n")
+		}
+
+		fmt.Println("[DEBUG REQUEST] ---")
+
+		// Create a custom ResponseWriter to capture status code and body
+		rw := &responseWrapper{
+			ResponseWriter: w,
+			statusCode:     200, // Default status code
+			body:           &bytes.Buffer{},
+		}
+
+		// Call the next handler
+		next.ServeHTTP(rw, r)
+
+		// Print response status code
+		fmt.Printf("[DEBUG RESPONSE] Status: %d %s\n", rw.statusCode, http.StatusText(rw.statusCode))
+
+		// Print response headers (captured from the original ResponseWriter)
+		fmt.Printf("[DEBUG RESPONSE] Headers:\n")
+		for name, values := range w.Header() {
+			for _, value := range values {
+				fmt.Printf("[DEBUG RESPONSE]   %s: %s\n", name, value)
+			}
+		}
+
+		// Print response body
+		responseBody := rw.body.Bytes()
+		if len(responseBody) > 0 {
+			fmt.Printf("[DEBUG RESPONSE] Body:\n%s\n", string(responseBody))
+		} else {
+			fmt.Printf("[DEBUG RESPONSE] Body: (empty)\n")
+		}
+
+		fmt.Println("[DEBUG RESPONSE] ---")
+	})
+}
+
+type responseWrapper struct {
+	http.ResponseWriter
+	statusCode int
+	body       *bytes.Buffer
+}
+
+func (rw *responseWrapper) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWrapper) Write(b []byte) (int, error) {
+	// Capture the response body
+	if rw.body != nil {
+		rw.body.Write(b)
+	}
+
+	// Write to the original response writer
+	return rw.ResponseWriter.Write(b)
 }
